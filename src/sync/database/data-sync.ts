@@ -30,7 +30,6 @@ export class DataSync {
       '--no-owner',
       '--no-privileges',
       '--disable-triggers',
-      '--use-copy',
       '-f', dumpFile,
     ];
 
@@ -126,7 +125,7 @@ export class DataSync {
         }
       }
 
-      await client.query('SET session_replication_role = DEFAULT;');
+      // Don't reset session_replication_role here - it will be done after import
     } finally {
       client.release();
     }
@@ -138,21 +137,110 @@ export class DataSync {
     const targetDbUrl = this.connectionBuilder.buildDbUrl(this.config.target);
 
     try {
-      await execa('psql', [
+      // Use -c to set session_replication_role before importing
+      // This disables triggers and allows data import without constraint checks
+      const result = await execa('psql', [
         targetDbUrl,
+        '-c', 'SET session_replication_role = replica;',
         '-f', dumpFile,
-        '-v', 'ON_ERROR_STOP=0',
       ], {
         env: { ...process.env, PGPASSWORD: this.config.target.dbPassword },
+        reject: false, // Don't throw on non-zero exit
       });
 
-      logger.info('Data imported successfully');
+      if (result.stderr && result.stderr.trim()) {
+        const errorLines = result.stderr.split('\n').filter(line =>
+          line.includes('ERROR') || line.includes('error')
+        );
+        if (errorLines.length > 0) {
+          logger.warn(`Data import had errors:\n${errorLines.slice(0, 10).join('\n')}`);
+          if (errorLines.length > 10) {
+            logger.warn(`... and ${errorLines.length - 10} more errors`);
+          }
+        }
+      }
+
+      if (result.exitCode !== 0) {
+        logger.warn(`Data import completed with exit code ${result.exitCode}`);
+        // Log some of the output for debugging
+        if (result.stderr) {
+          logger.debug(`psql stderr: ${result.stderr.slice(0, 1000)}`);
+        }
+      } else {
+        logger.info('Data imported successfully');
+      }
     } catch (error) {
       logger.warn(`Data import completed with warnings: ${(error as Error).message}`);
     }
   }
 
-  async sync(): Promise<void> {
+  async verifyDataCounts(sourcePool: PostgresPool): Promise<void> {
+    logger.info('Verifying data counts between source and target...');
+
+    const sourceClient = await sourcePool.connect();
+    const targetClient = await this.targetPool.connect();
+
+    try {
+      // Get table counts from source
+      const tablesResult = await sourceClient.query(`
+        SELECT schemaname, tablename
+        FROM pg_tables
+        WHERE schemaname = ANY($1)
+        AND tablename NOT IN ('schema_migrations', 'migrations')
+        ORDER BY schemaname, tablename
+      `, [this.config.options.database.includeSchemas]);
+
+      const mismatches: { table: string; source: number; target: number }[] = [];
+
+      for (const row of tablesResult.rows) {
+        const tableName = `${row.schemaname}.${row.tablename}`;
+
+        // Skip excluded tables
+        if (this.config.options.database.excludeTables.includes(tableName)) {
+          continue;
+        }
+
+        try {
+          const sourceCount = await sourceClient.query(
+            `SELECT COUNT(*) as count FROM "${row.schemaname}"."${row.tablename}"`
+          );
+          const targetCount = await targetClient.query(
+            `SELECT COUNT(*) as count FROM "${row.schemaname}"."${row.tablename}"`
+          );
+
+          const srcCount = parseInt(sourceCount.rows[0]?.count || '0', 10);
+          const tgtCount = parseInt(targetCount.rows[0]?.count || '0', 10);
+
+          if (srcCount !== tgtCount) {
+            mismatches.push({
+              table: tableName,
+              source: srcCount,
+              target: tgtCount,
+            });
+          }
+        } catch (error) {
+          logger.debug(`Could not verify ${tableName}: ${(error as Error).message}`);
+        }
+      }
+
+      if (mismatches.length > 0) {
+        logger.warn(`Found ${mismatches.length} tables with row count mismatches:`);
+        for (const m of mismatches.slice(0, 20)) {
+          logger.warn(`  ${m.table}: source=${m.source}, target=${m.target}`);
+        }
+        if (mismatches.length > 20) {
+          logger.warn(`  ... and ${mismatches.length - 20} more`);
+        }
+      } else {
+        logger.info('All table row counts match between source and target');
+      }
+    } finally {
+      sourceClient.release();
+      targetClient.release();
+    }
+  }
+
+  async sync(sourcePool?: PostgresPool): Promise<void> {
     if (this.config.dryRun) {
       logger.info('[DRY RUN] Would export and import database data');
       return;
@@ -168,6 +256,11 @@ export class DataSync {
       await this.importData(dumpFile);
     } finally {
       await this.enableConstraints();
+    }
+
+    // Verify data counts if source pool is provided
+    if (sourcePool) {
+      await this.verifyDataCounts(sourcePool);
     }
   }
 }

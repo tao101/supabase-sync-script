@@ -1,6 +1,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import pLimit from 'p-limit';
 import type { Config } from '../../types/config.js';
+import type { PostgresPool } from '../../clients/postgres-client.js';
 import { logger } from '../../utils/logger.js';
 import { StorageSyncResult, BucketSyncResult, StorageBucket, StorageFile } from '../../types/sync.js';
 
@@ -8,7 +9,8 @@ export class StorageSync {
   constructor(
     private config: Config,
     private sourceSupabase: SupabaseClient,
-    private targetSupabase: SupabaseClient
+    private targetSupabase: SupabaseClient,
+    private targetPool?: PostgresPool
   ) {}
 
   async listBuckets(): Promise<StorageBucket[]> {
@@ -197,6 +199,82 @@ export class StorageSync {
 
     logger.info(`Storage sync complete: ${results.length} buckets, ${totalUploaded}/${totalFiles} files, ${totalFailed} failed`);
 
+    // Rewrite storage URLs in database to point to target
+    if (this.targetPool) {
+      await this.rewriteStorageUrls();
+    }
+
     return { buckets: results };
+  }
+
+  /**
+   * Rewrite storage URLs in database to point to target Supabase instance
+   * This updates URLs that reference the source storage to use the target storage
+   */
+  async rewriteStorageUrls(): Promise<void> {
+    logger.info('Rewriting storage URLs in database...');
+
+    const sourceApiUrl = this.config.source.apiUrl;
+    const targetApiUrl = this.config.target.apiUrl;
+
+    // Normalize URLs (remove trailing slashes)
+    const sourceUrl = sourceApiUrl.replace(/\/$/, '');
+    const targetUrl = targetApiUrl.replace(/\/$/, '');
+
+    if (sourceUrl === targetUrl) {
+      logger.info('Source and target URLs are the same, skipping URL rewrite');
+      return;
+    }
+
+    const client = await this.targetPool!.connect();
+    try {
+      let totalUpdated = 0;
+
+      // Update auth.users raw_user_meta_data avatar_url
+      const authResult = await client.query(`
+        UPDATE auth.users
+        SET raw_user_meta_data = jsonb_set(
+          raw_user_meta_data,
+          '{avatar_url}',
+          to_jsonb(replace(raw_user_meta_data->>'avatar_url', $1, $2))
+        )
+        WHERE raw_user_meta_data->>'avatar_url' LIKE $3
+      `, [sourceUrl, targetUrl, `${sourceUrl}%`]);
+
+      if (authResult.rowCount && authResult.rowCount > 0) {
+        logger.info(`Updated ${authResult.rowCount} avatar URLs in auth.users`);
+        totalUpdated += authResult.rowCount;
+      }
+
+      // Find and update text columns containing storage URLs in public schema
+      const columnsResult = await client.query(`
+        SELECT table_name, column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+        AND data_type IN ('text', 'character varying')
+        AND column_name LIKE '%url%'
+      `);
+
+      for (const row of columnsResult.rows) {
+        try {
+          const updateResult = await client.query(`
+            UPDATE "public"."${row.table_name}"
+            SET "${row.column_name}" = replace("${row.column_name}", $1, $2)
+            WHERE "${row.column_name}" LIKE $3
+          `, [sourceUrl, targetUrl, `${sourceUrl}%`]);
+
+          if (updateResult.rowCount && updateResult.rowCount > 0) {
+            logger.info(`Updated ${updateResult.rowCount} URLs in public.${row.table_name}.${row.column_name}`);
+            totalUpdated += updateResult.rowCount;
+          }
+        } catch (error) {
+          logger.debug(`Could not update ${row.table_name}.${row.column_name}: ${(error as Error).message}`);
+        }
+      }
+
+      logger.info(`Total storage URLs rewritten: ${totalUpdated}`);
+    } finally {
+      client.release();
+    }
   }
 }

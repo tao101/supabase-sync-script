@@ -1,18 +1,45 @@
 import type { SupabaseConnection } from '../types/config.js';
+import { shouldUseSsl } from '../clients/postgres-client.js';
 
 export class ConnectionBuilder {
   /**
-   * Get the database connection URL
+   * Get the database connection URL with appropriate SSL mode
    */
   buildDbUrl(config: SupabaseConnection): string {
-    return config.dbUrl;
+    return this.addSslModeIfNeeded(config.dbUrl);
   }
 
   /**
-   * Get direct database connection URL (same as buildDbUrl now)
+   * Get direct database connection URL with appropriate SSL mode
    */
   buildDirectDbUrl(config: SupabaseConnection): string {
-    return config.dbUrl;
+    return this.addSslModeIfNeeded(config.dbUrl);
+  }
+
+  /**
+   * Add sslmode parameter to URL if SSL is disabled for this host
+   */
+  private addSslModeIfNeeded(dbUrl: string): string {
+    const useSsl = shouldUseSsl(dbUrl);
+
+    // If SSL should be used, return URL as-is (default behavior)
+    if (useSsl) {
+      return dbUrl;
+    }
+
+    // Add sslmode=disable if not already present
+    try {
+      const url = new URL(dbUrl);
+      if (!url.searchParams.has('sslmode')) {
+        url.searchParams.set('sslmode', 'disable');
+        return url.toString();
+      }
+      return dbUrl;
+    } catch {
+      // If URL parsing fails, append sslmode manually
+      const separator = dbUrl.includes('?') ? '&' : '?';
+      return `${dbUrl}${separator}sslmode=disable`;
+    }
   }
 
   /**

@@ -156,9 +156,9 @@ export class SyncOrchestrator {
   }
 
   private async syncData(): Promise<void> {
-    if (!this.targetPool) throw new Error('Target pool not initialized');
+    if (!this.sourcePool || !this.targetPool) throw new Error('Pools not initialized');
     const dataSync = new DataSync(this.config, this.tempFileManager, this.targetPool);
-    await dataSync.sync();
+    await dataSync.sync(this.sourcePool);
   }
 
   private async resetSequences(): Promise<void> {
@@ -187,7 +187,8 @@ export class SyncOrchestrator {
     const storageSync = new StorageSync(
       this.config,
       this.sourceSupabase,
-      this.targetSupabase
+      this.targetSupabase,
+      this.targetPool || undefined
     );
     await storageSync.sync();
   }

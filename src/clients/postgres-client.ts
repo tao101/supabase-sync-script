@@ -64,6 +64,20 @@ export function setSslPreference(dbUrl: string, useSsl: boolean): void {
   sslPreference.set(host, useSsl);
 }
 
+export function getSslPreference(dbUrl: string): boolean | undefined {
+  const host = getHostFromUrl(dbUrl);
+  return sslPreference.get(host);
+}
+
+export function shouldUseSsl(dbUrl: string): boolean {
+  const isLocalhost = isLocalConnection(dbUrl);
+  if (isLocalhost) return false;
+
+  const preference = getSslPreference(dbUrl);
+  // Default to true (SSL) unless explicitly set to false
+  return preference !== false;
+}
+
 export async function testPostgresConnection(pool: PostgresPool): Promise<{ success: boolean; error?: string }> {
   let client: pg.PoolClient | null = null;
   try {
