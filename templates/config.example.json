@@ -1,0 +1,44 @@
+{
+  "source": {
+    "type": "saas",
+    "projectRef": "your-project-ref",
+    "dbPassword": "your-database-password",
+    "serviceRoleKey": "your-service-role-key"
+  },
+  "target": {
+    "type": "self-hosted",
+    "host": "supabase.example.com",
+    "port": 5432,
+    "dbPassword": "your-target-database-password",
+    "serviceRoleKey": "your-target-service-role-key",
+    "apiUrl": "https://supabase.example.com"
+  },
+  "options": {
+    "components": {
+      "schema": true,
+      "data": true,
+      "auth": true,
+      "storage": true,
+      "roles": true
+    },
+    "database": {
+      "includeSchemas": ["public", "auth", "storage"],
+      "excludeSchemas": ["pg_catalog", "information_schema", "pg_toast"],
+      "excludeTables": ["auth.sessions", "auth.refresh_tokens"]
+    },
+    "storage": {
+      "excludeBuckets": [],
+      "maxFileSizeMB": 50,
+      "concurrency": 5
+    },
+    "auth": {
+      "preservePasswordHashes": true,
+      "migrateIdentities": true,
+      "skipSessions": true
+    }
+  },
+  "mode": "ci",
+  "dryRun": false,
+  "verbose": false,
+  "tempDir": "/tmp/supabase-sync"
+}

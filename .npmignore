@@ -1,0 +1,32 @@
+# Source files (compiled dist is included)
+src/
+
+# Development files
+.claude/
+*.log
+.env
+.env.*
+!.env.example
+
+# IDE
+.vscode/
+.idea/
+
+# Test files
+tests/
+__tests__/
+*.test.ts
+*.spec.ts
+coverage/
+
+# Build artifacts
+node_modules/
+tsconfig.json
+
+# Git
+.git/
+.gitignore
+
+# Misc
+*.md
+!README.md

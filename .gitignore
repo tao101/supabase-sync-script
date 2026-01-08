@@ -1,0 +1,65 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Config files with secrets
+config.json
+sync-config.json
+.supabase-sync.json
+
+# Temporary files
+/tmp/
+*.tmp
+*.temp
+supabase-sync-*/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# IDE / Editor
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+.project
+.classpath
+.settings/
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# npm
+*.tgz
+package-lock.json
+
+# TypeScript cache
+*.tsbuildinfo
+
+# Debug
+.debug/
+
+# Claude
+.claude/
+
+# SQL dump files (may contain sensitive data)
+*.sql
+!templates/*.sql
