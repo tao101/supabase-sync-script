@@ -41,13 +41,17 @@ export class SyncOrchestrator {
         await this.runStep('sync-schema', () => this.syncSchema());
       }
 
+      // Auth sync must run BEFORE data sync because:
+      // - Auth creates users via Admin API which triggers database triggers
+      // - These triggers may create rows in tables like user_roles
+      // - Data sync will then overwrite those trigger-created rows with the correct source data
+      if (this.config.options.components.auth) {
+        await this.runStep('sync-auth', () => this.syncAuth());
+      }
+
       if (this.config.options.components.data) {
         await this.runStep('sync-data', () => this.syncData());
         await this.runStep('reset-sequences', () => this.resetSequences());
-      }
-
-      if (this.config.options.components.auth) {
-        await this.runStep('sync-auth', () => this.syncAuth());
       }
 
       if (this.config.options.components.storage) {
