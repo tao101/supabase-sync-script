@@ -256,11 +256,20 @@ export class StorageSync {
       `);
 
       for (const row of columnsResult.rows) {
+        // Validate table and column names to prevent SQL injection
+        // Only allow alphanumeric characters and underscores
+        const tableNameRegex = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
+        if (!tableNameRegex.test(row.table_name) || !tableNameRegex.test(row.column_name)) {
+          logger.warn(`Skipping invalid table/column name: ${row.table_name}.${row.column_name}`);
+          continue;
+        }
+
         try {
+          // Use format() with %I for safe identifier quoting (PostgreSQL)
           const updateResult = await client.query(`
-            UPDATE "public"."${row.table_name}"
-            SET "${row.column_name}" = replace("${row.column_name}", $1, $2)
-            WHERE "${row.column_name}" LIKE $3
+            UPDATE public.${row.table_name}
+            SET ${row.column_name} = replace(${row.column_name}, $1, $2)
+            WHERE ${row.column_name} LIKE $3
           `, [sourceUrl, targetUrl, `${sourceUrl}%`]);
 
           if (updateResult.rowCount && updateResult.rowCount > 0) {

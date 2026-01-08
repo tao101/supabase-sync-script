@@ -66,16 +66,35 @@ export class SchemaSync {
     const processedFile = await this.preprocessDumpFile(dumpFile);
 
     try {
-      await execa('psql', [
+      const result = await execa('psql', [
         targetDbUrl,
         '-f', processedFile,
         '--single-transaction',
         '-v', 'ON_ERROR_STOP=0', // Continue on errors (some objects may already exist)
       ], {
         env: { ...process.env, PGPASSWORD: this.config.target.dbPassword },
+        reject: false, // Don't throw on non-zero exit
       });
 
-      logger.info('Schema imported successfully');
+      // Check for actual errors in stderr
+      if (result.stderr && result.stderr.trim()) {
+        const errorLines = result.stderr.split('\n').filter(line =>
+          line.includes('ERROR') && !line.includes('already exists')
+        );
+        if (errorLines.length > 0) {
+          logger.warn(`Schema import had ${errorLines.length} errors (some may be expected):`);
+          errorLines.slice(0, 5).forEach(line => logger.warn(`  ${line.trim()}`));
+          if (errorLines.length > 5) {
+            logger.warn(`  ... and ${errorLines.length - 5} more errors`);
+          }
+        }
+      }
+
+      if (result.exitCode !== 0) {
+        logger.warn(`Schema import completed with exit code ${result.exitCode} (some errors may be expected)`);
+      } else {
+        logger.info('Schema imported successfully');
+      }
     } catch (error) {
       // Log but don't fail - some errors are expected (existing objects)
       logger.warn(`Schema import completed with warnings: ${(error as Error).message}`);

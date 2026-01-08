@@ -35,15 +35,15 @@
     "self-hosted",
     "cli"
   ],
-  "author": "",
+  "author": "Taoufiq Lotfi <admin@taoufiqlotfi.tech>",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": ""
+    "url": "git+https://github.com/tao101/supabase-sync.git"
   },
-  "homepage": "",
+  "homepage": "https://github.com/tao101/supabase-sync#readme",
   "bugs": {
-    "url": ""
+    "url": "https://github.com/tao101/supabase-sync/issues"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
