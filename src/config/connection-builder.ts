@@ -1,129 +1,47 @@
-import type { SupabaseConnection, ConnectionType } from '../types/config.js';
+import type { SupabaseConnection } from '../types/config.js';
 
 export class ConnectionBuilder {
   /**
-   * Build PostgreSQL connection URL based on connection type
+   * Get the database connection URL
    */
   buildDbUrl(config: SupabaseConnection): string {
-    // If explicit dbUrl is provided, use it
-    if (config.dbUrl) {
-      return config.dbUrl;
-    }
-
-    switch (config.type) {
-      case 'saas':
-        if (!config.projectRef) {
-          throw new Error('projectRef is required for SaaS connection');
-        }
-        // SaaS uses pooler connection
-        // Format: postgresql://postgres.[project-ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres
-        return `postgresql://postgres.${config.projectRef}:${encodeURIComponent(config.dbPassword)}@aws-0-us-east-1.pooler.supabase.com:6543/postgres`;
-
-      case 'self-hosted':
-        if (!config.host) {
-          throw new Error('host is required for self-hosted connection');
-        }
-        return `postgresql://postgres:${encodeURIComponent(config.dbPassword)}@${config.host}:${config.port}/postgres`;
-
-      case 'local':
-        // Local Supabase CLI default
-        const host = config.host || 'localhost';
-        const port = config.port || 54322;
-        return `postgresql://postgres:${encodeURIComponent(config.dbPassword)}@${host}:${port}/postgres`;
-
-      default:
-        throw new Error(`Unknown connection type: ${config.type}`);
-    }
+    return config.dbUrl;
   }
 
   /**
-   * Build Supabase API URL based on connection type
-   */
-  buildApiUrl(config: SupabaseConnection): string {
-    // If explicit apiUrl is provided, use it
-    if (config.apiUrl) {
-      return config.apiUrl;
-    }
-
-    switch (config.type) {
-      case 'saas':
-        if (!config.projectRef) {
-          throw new Error('projectRef is required for SaaS connection');
-        }
-        return `https://${config.projectRef}.supabase.co`;
-
-      case 'self-hosted':
-        if (!config.host) {
-          throw new Error('host is required for self-hosted connection');
-        }
-        // Self-hosted typically uses Kong on port 8000 or direct API
-        return `https://${config.host}`;
-
-      case 'local':
-        return 'http://localhost:54321';
-
-      default:
-        throw new Error(`Unknown connection type: ${config.type}`);
-    }
-  }
-
-  /**
-   * Build direct database connection URL (bypassing pooler for operations that need it)
+   * Get direct database connection URL (same as buildDbUrl now)
    */
   buildDirectDbUrl(config: SupabaseConnection): string {
-    switch (config.type) {
-      case 'saas':
-        if (!config.projectRef) {
-          throw new Error('projectRef is required for SaaS connection');
-        }
-        // Direct connection for SaaS (port 5432)
-        return `postgresql://postgres.${config.projectRef}:${encodeURIComponent(config.dbPassword)}@db.${config.projectRef}.supabase.co:5432/postgres`;
-
-      case 'self-hosted':
-      case 'local':
-        // Same as regular for self-hosted/local
-        return this.buildDbUrl(config);
-
-      default:
-        throw new Error(`Unknown connection type: ${config.type}`);
-    }
+    return config.dbUrl;
   }
 
   /**
-   * Validate that required fields are present for the connection type
+   * Get the Supabase API URL
+   */
+  buildApiUrl(config: SupabaseConnection): string {
+    return config.apiUrl;
+  }
+
+  /**
+   * Validate that required fields are present
    */
   validateConnection(config: SupabaseConnection): string[] {
     const errors: string[] = [];
 
-    if (!config.type) {
-      errors.push('Connection type is required');
-      return errors;
+    if (!config.dbUrl) {
+      errors.push('Database URL is required');
+    } else if (!config.dbUrl.startsWith('postgresql://') && !config.dbUrl.startsWith('postgres://')) {
+      errors.push('Database URL must start with postgresql:// or postgres://');
     }
 
-    if (!config.dbPassword) {
-      errors.push('Database password is required');
+    if (!config.apiUrl) {
+      errors.push('API URL is required');
+    } else if (!config.apiUrl.startsWith('http://') && !config.apiUrl.startsWith('https://')) {
+      errors.push('API URL must start with http:// or https://');
     }
 
     if (!config.serviceRoleKey) {
       errors.push('Service role key is required');
-    }
-
-    switch (config.type) {
-      case 'saas':
-        if (!config.projectRef) {
-          errors.push('Project reference is required for SaaS connection');
-        }
-        break;
-
-      case 'self-hosted':
-        if (!config.host) {
-          errors.push('Host is required for self-hosted connection');
-        }
-        break;
-
-      case 'local':
-        // Local has defaults, nothing strictly required beyond password
-        break;
     }
 
     return errors;
@@ -133,13 +51,36 @@ export class ConnectionBuilder {
    * Get a display-safe version of the connection (no passwords)
    */
   getSafeDisplay(config: SupabaseConnection): Record<string, string> {
+    // Parse the database URL to extract host
+    let host = 'unknown';
+    try {
+      const url = new URL(config.dbUrl);
+      host = url.hostname;
+    } catch {
+      // If URL parsing fails, try to extract host manually
+      const match = config.dbUrl.match(/@([^:\/]+)/);
+      if (match) {
+        host = match[1];
+      }
+    }
+
     return {
-      type: config.type,
-      ...(config.projectRef && { projectRef: config.projectRef }),
-      ...(config.host && { host: config.host }),
-      port: String(config.port || 5432),
-      apiUrl: this.buildApiUrl(config),
-      dbUrl: this.buildDbUrl(config).replace(/:[^:@]+@/, ':***@'),
+      host,
+      apiUrl: config.apiUrl,
+      dbUrl: config.dbUrl.replace(/:[^:@]+@/, ':***@'),
     };
+  }
+
+  /**
+   * Extract host from database URL
+   */
+  getHostFromDbUrl(dbUrl: string): string {
+    try {
+      const url = new URL(dbUrl);
+      return url.hostname;
+    } catch {
+      const match = dbUrl.match(/@([^:\/]+)/);
+      return match ? match[1] : 'unknown';
+    }
   }
 }

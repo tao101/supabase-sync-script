@@ -1,6 +1,5 @@
 import pg from 'pg';
 import type { SupabaseConnection } from '../types/config.js';
-import { ConnectionBuilder } from '../config/connection-builder.js';
 import { logger } from '../utils/logger.js';
 
 const { Pool, Client } = pg;
@@ -8,53 +7,92 @@ const { Pool, Client } = pg;
 export type PostgresPool = pg.Pool;
 export type PostgresClient = pg.Client;
 
-export function createPostgresPool(
-  connection: SupabaseConnection,
-  useDirect: boolean = false
-): PostgresPool {
-  const builder = new ConnectionBuilder();
-  const connectionString = useDirect
-    ? builder.buildDirectDbUrl(connection)
-    : builder.buildDbUrl(connection);
+// Track SSL preference per connection URL
+const sslPreference = new Map<string, boolean>();
 
-  logger.debug(`Creating Postgres pool for ${connection.type} connection`);
+function getHostFromUrl(dbUrl: string): string {
+  try {
+    const url = new URL(dbUrl);
+    return url.hostname;
+  } catch {
+    return dbUrl;
+  }
+}
+
+function isLocalConnection(dbUrl: string): boolean {
+  return dbUrl.includes('localhost') || dbUrl.includes('127.0.0.1');
+}
+
+export function createPostgresPool(connection: SupabaseConnection, forceNoSsl?: boolean): PostgresPool {
+  logger.debug(`Creating Postgres pool`);
+
+  const isLocalhost = isLocalConnection(connection.dbUrl);
+  const host = getHostFromUrl(connection.dbUrl);
+
+  // Check if we've already determined SSL preference for this host
+  const useNoSsl = forceNoSsl || sslPreference.get(host) === false;
+  const useSsl = !isLocalhost && !useNoSsl;
 
   return new Pool({
-    connectionString,
-    ssl: connection.type === 'local' ? false : { rejectUnauthorized: false },
+    connectionString: connection.dbUrl,
+    ssl: useSsl ? { rejectUnauthorized: false } : false,
     max: 5,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 10000,
   });
 }
 
-export function createPostgresClient(
-  connection: SupabaseConnection,
-  useDirect: boolean = false
-): PostgresClient {
-  const builder = new ConnectionBuilder();
-  const connectionString = useDirect
-    ? builder.buildDirectDbUrl(connection)
-    : builder.buildDbUrl(connection);
+export function createPostgresClient(connection: SupabaseConnection, forceNoSsl?: boolean): PostgresClient {
+  logger.debug(`Creating Postgres client`);
 
-  logger.debug(`Creating Postgres client for ${connection.type} connection`);
+  const isLocalhost = isLocalConnection(connection.dbUrl);
+  const host = getHostFromUrl(connection.dbUrl);
+
+  // Check if we've already determined SSL preference for this host
+  const useNoSsl = forceNoSsl || sslPreference.get(host) === false;
+  const useSsl = !isLocalhost && !useNoSsl;
 
   return new Client({
-    connectionString,
-    ssl: connection.type === 'local' ? false : { rejectUnauthorized: false },
+    connectionString: connection.dbUrl,
+    ssl: useSsl ? { rejectUnauthorized: false } : false,
     connectionTimeoutMillis: 10000,
   });
 }
 
-export async function testPostgresConnection(pool: PostgresPool): Promise<boolean> {
+export function setSslPreference(dbUrl: string, useSsl: boolean): void {
+  const host = getHostFromUrl(dbUrl);
+  sslPreference.set(host, useSsl);
+}
+
+export async function testPostgresConnection(pool: PostgresPool): Promise<{ success: boolean; error?: string }> {
   let client: pg.PoolClient | null = null;
   try {
     client = await pool.connect();
     const result = await client.query('SELECT 1 as test');
-    return result.rows[0]?.test === 1;
+    return { success: result.rows[0]?.test === 1 };
   } catch (error) {
-    logger.error('Postgres connection test failed:', { error });
-    return false;
+    const err = error as Error & { code?: string };
+    const errorMessage = err.message || 'Unknown error';
+    const errorCode = err.code || '';
+
+    // Provide helpful messages for common errors
+    let helpfulMessage = errorMessage;
+    if (errorCode === 'ECONNREFUSED') {
+      helpfulMessage = `Connection refused - check if the database server is running and accessible at the specified host/port`;
+    } else if (errorCode === 'ENOTFOUND') {
+      helpfulMessage = `Host not found - check the hostname in your database URL`;
+    } else if (errorCode === '28P01' || errorMessage.includes('password authentication failed')) {
+      helpfulMessage = `Authentication failed - check your username and password`;
+    } else if (errorCode === '3D000' || errorMessage.includes('does not exist')) {
+      helpfulMessage = `Database not found - check the database name in your URL`;
+    } else if (errorCode === 'ETIMEDOUT') {
+      helpfulMessage = `Connection timed out - the server may be unreachable or behind a firewall`;
+    } else if (errorMessage.includes('SSL')) {
+      helpfulMessage = `SSL error - ${errorMessage}`;
+    }
+
+    logger.error('Postgres connection test failed:', { message: helpfulMessage, code: errorCode });
+    return { success: false, error: helpfulMessage };
   } finally {
     if (client) {
       client.release();

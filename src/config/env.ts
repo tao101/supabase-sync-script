@@ -1,5 +1,5 @@
 import { config as dotenvConfig } from 'dotenv';
-import type { Config, SupabaseConnection, ConnectionType } from '../types/config.js';
+import type { Config, SupabaseConnection } from '../types/config.js';
 
 // Load .env file
 dotenvConfig();
@@ -30,29 +30,19 @@ function getEnvVarAsBoolean(name: string, defaultValue: boolean = false): boolea
 
 export function loadSourceFromEnv(): Partial<SupabaseConnection> {
   return {
-    type: getEnvVar('SOURCE_TYPE') as ConnectionType | undefined,
-    projectRef: getEnvVar('SOURCE_PROJECT_REF'),
-    host: getEnvVar('SOURCE_HOST'),
-    port: getEnvVarAsNumber('SOURCE_PORT', 5432),
-    dbPassword: getEnvVar('SOURCE_DB_PASSWORD'),
+    dbUrl: getEnvVar('SOURCE_DB_URL'),
+    apiUrl: getEnvVar('SOURCE_API_URL'),
     serviceRoleKey: getEnvVar('SOURCE_SERVICE_ROLE_KEY'),
     anonKey: getEnvVar('SOURCE_ANON_KEY'),
-    apiUrl: getEnvVar('SOURCE_API_URL'),
-    dbUrl: getEnvVar('SOURCE_DB_URL'),
   };
 }
 
 export function loadTargetFromEnv(): Partial<SupabaseConnection> {
   return {
-    type: getEnvVar('TARGET_TYPE') as ConnectionType | undefined,
-    projectRef: getEnvVar('TARGET_PROJECT_REF'),
-    host: getEnvVar('TARGET_HOST'),
-    port: getEnvVarAsNumber('TARGET_PORT', 5432),
-    dbPassword: getEnvVar('TARGET_DB_PASSWORD'),
+    dbUrl: getEnvVar('TARGET_DB_URL'),
+    apiUrl: getEnvVar('TARGET_API_URL'),
     serviceRoleKey: getEnvVar('TARGET_SERVICE_ROLE_KEY'),
     anonKey: getEnvVar('TARGET_ANON_KEY'),
-    apiUrl: getEnvVar('TARGET_API_URL'),
-    dbUrl: getEnvVar('TARGET_DB_URL'),
   };
 }
 

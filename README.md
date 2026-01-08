@@ -34,6 +34,7 @@ supabase-sync sync
 - **Roles Sync**: Database roles (filters out built-in Supabase roles)
 - **Two Modes**: Interactive (guided prompts) and CI (automated)
 - **Dry Run**: Preview changes without applying them
+- **Connection Testing**: Validates database URLs immediately after input
 
 ## Prerequisites
 
@@ -64,10 +65,12 @@ npx supabase-sync sync
 ```
 
 You'll be guided through:
-1. Selecting source type and entering credentials
-2. Selecting target type and entering credentials
-3. Choosing which components to sync
-4. Confirming the operation
+1. Entering source database URL (connection tested immediately)
+2. Entering source Supabase API URL and service role key
+3. Entering target database URL (connection tested immediately)
+4. Entering target Supabase API URL and service role key
+5. Choosing which components to sync
+6. Confirming the operation
 
 ### CI Mode
 
@@ -75,15 +78,13 @@ For automated pipelines, use environment variables:
 
 ```bash
 # Set environment variables
-export SOURCE_TYPE=saas
-export SOURCE_PROJECT_REF=your-project-ref
-export SOURCE_DB_PASSWORD=your-password
-export SOURCE_SERVICE_ROLE_KEY=your-service-role-key
-export TARGET_TYPE=self-hosted
-export TARGET_HOST=supabase.example.com
-export TARGET_DB_PASSWORD=your-target-password
-export TARGET_SERVICE_ROLE_KEY=your-target-key
-export TARGET_API_URL=https://supabase.example.com
+export SOURCE_DB_URL="postgresql://postgres:password@db.your-project.supabase.co:5432/postgres"
+export SOURCE_API_URL="https://your-project.supabase.co"
+export SOURCE_SERVICE_ROLE_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+
+export TARGET_DB_URL="postgresql://postgres:password@your-server.com:5432/postgres"
+export TARGET_API_URL="https://supabase.your-server.com"
+export TARGET_SERVICE_ROLE_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
 
 # Run in CI mode
 npx supabase-sync sync --ci
@@ -156,18 +157,14 @@ npx supabase-sync test-connection --config ./config.json
 ```json
 {
   "source": {
-    "type": "saas",
-    "projectRef": "abcdefghijklmnop",
-    "dbPassword": "your-database-password",
+    "dbUrl": "postgresql://postgres:your-password@db.your-project.supabase.co:5432/postgres",
+    "apiUrl": "https://your-project.supabase.co",
     "serviceRoleKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
   },
   "target": {
-    "type": "self-hosted",
-    "host": "supabase.example.com",
-    "port": 5432,
-    "dbPassword": "your-target-password",
-    "serviceRoleKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-    "apiUrl": "https://supabase.example.com"
+    "dbUrl": "postgresql://postgres:your-password@your-server.com:5432/postgres",
+    "apiUrl": "https://supabase.your-server.com",
+    "serviceRoleKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
   },
   "options": {
     "components": {
@@ -199,34 +196,17 @@ npx supabase-sync test-connection --config ./config.json
 SYNC_MODE=ci                    # ci or interactive
 SYNC_DRY_RUN=false
 SYNC_VERBOSE=false
+SYNC_TEMP_DIR=/tmp/supabase-sync
 
-# Source - SaaS (Supabase Cloud)
-SOURCE_TYPE=saas
-SOURCE_PROJECT_REF=abcdefghij   # From your Supabase dashboard URL
-SOURCE_DB_PASSWORD=xxx
-SOURCE_SERVICE_ROLE_KEY=xxx
+# Source Configuration
+SOURCE_DB_URL=postgresql://postgres:password@db.your-project.supabase.co:5432/postgres
+SOURCE_API_URL=https://your-project.supabase.co
+SOURCE_SERVICE_ROLE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 
-# Source - Self-hosted
-SOURCE_TYPE=self-hosted
-SOURCE_HOST=supabase.example.com
-SOURCE_PORT=5432
-SOURCE_DB_PASSWORD=xxx
-SOURCE_SERVICE_ROLE_KEY=xxx
-SOURCE_API_URL=https://supabase.example.com
-
-# Source - Local (supabase start)
-SOURCE_TYPE=local
-SOURCE_PORT=54322
-SOURCE_DB_PASSWORD=postgres
-SOURCE_SERVICE_ROLE_KEY=xxx     # From `supabase status`
-
-# Target (same options as source)
-TARGET_TYPE=self-hosted
-TARGET_HOST=supabase.example.com
-TARGET_PORT=5432
-TARGET_DB_PASSWORD=xxx
-TARGET_SERVICE_ROLE_KEY=xxx
-TARGET_API_URL=https://supabase.example.com
+# Target Configuration
+TARGET_DB_URL=postgresql://postgres:password@your-server.com:5432/postgres
+TARGET_API_URL=https://supabase.your-server.com
+TARGET_SERVICE_ROLE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 
 # Component toggles
 SYNC_SCHEMA=true
@@ -238,34 +218,46 @@ SYNC_ROLES=true
 # Storage options
 STORAGE_CONCURRENCY=5
 STORAGE_MAX_FILE_SIZE_MB=50
-STORAGE_EXCLUDE_BUCKETS=temp,cache
+# STORAGE_EXCLUDE_BUCKETS=temp,cache
 ```
 
-## Connection Types
+## Database URL Format
 
-### SaaS (Supabase Cloud)
+The database URL follows the PostgreSQL connection string format:
 
-For projects hosted on supabase.com:
+```
+postgresql://[user]:[password]@[host]:[port]/[database]
+```
 
-- **projectRef**: Found in your dashboard URL (`https://supabase.com/dashboard/project/[projectRef]`)
-- **dbPassword**: Project Settings > Database > Connection string
-- **serviceRoleKey**: Project Settings > API > service_role key
+### Examples
 
-### Self-hosted
+**Supabase Cloud (SaaS):**
+```
+postgresql://postgres:your-password@db.abcdefghijk.supabase.co:5432/postgres
+```
 
-For self-hosted Supabase instances, you'll need:
-- Host address
-- Database port (default: 5432)
-- Database password
-- Service role key
-- API URL
+**Self-hosted Supabase:**
+```
+postgresql://postgres:your-password@supabase.example.com:5432/postgres
+```
 
-### Local
+**Local Supabase (supabase start):**
+```
+postgresql://postgres:postgres@localhost:54322/postgres
+```
 
-For local development with `supabase start`:
-- Default port: 54322
-- Default password: postgres
-- Get service role key from `supabase status`
+### Finding Your Database URL
+
+**Supabase Cloud:**
+1. Go to your project dashboard
+2. Click "Project Settings" > "Database"
+3. Copy the connection string (URI format)
+
+**Self-hosted:**
+Use your database host, port, and credentials.
+
+**Local:**
+Run `supabase status` to see connection details.
 
 ## Sync Workflow
 
@@ -289,7 +281,7 @@ For local development with `supabase start`:
 
 ## Important Notes
 
-### ⚠️ Destructive Operation
+### Destructive Operation
 
 This tool performs a **full replacement** of data on the target. All existing data in the synced schemas will be **deleted and replaced**.
 
@@ -328,15 +320,12 @@ jobs:
 
       - name: Run sync
         env:
-          SOURCE_TYPE: saas
-          SOURCE_PROJECT_REF: ${{ secrets.SOURCE_PROJECT_REF }}
-          SOURCE_DB_PASSWORD: ${{ secrets.SOURCE_DB_PASSWORD }}
+          SOURCE_DB_URL: ${{ secrets.SOURCE_DB_URL }}
+          SOURCE_API_URL: ${{ secrets.SOURCE_API_URL }}
           SOURCE_SERVICE_ROLE_KEY: ${{ secrets.SOURCE_SERVICE_ROLE_KEY }}
-          TARGET_TYPE: self-hosted
-          TARGET_HOST: ${{ secrets.TARGET_HOST }}
-          TARGET_DB_PASSWORD: ${{ secrets.TARGET_DB_PASSWORD }}
-          TARGET_SERVICE_ROLE_KEY: ${{ secrets.TARGET_SERVICE_ROLE_KEY }}
+          TARGET_DB_URL: ${{ secrets.TARGET_DB_URL }}
           TARGET_API_URL: ${{ secrets.TARGET_API_URL }}
+          TARGET_SERVICE_ROLE_KEY: ${{ secrets.TARGET_SERVICE_ROLE_KEY }}
         run: npx supabase-sync sync --ci
 ```
 
@@ -347,6 +336,21 @@ jobs:
 ```bash
 # Test connections first
 npx supabase-sync test-connection --config ./config.json
+```
+
+### Invalid Database URL
+
+Ensure your database URL:
+- Starts with `postgresql://`
+- Contains the correct password (URL-encoded if special characters)
+- Uses the correct port (5432 for cloud, 54322 for local)
+
+**URL-encoding special characters in password:**
+```
+@ → %40
+# → %23
+? → %3F
+/ → %2F
 ```
 
 ### pg_dump/psql Not Found
@@ -360,7 +364,7 @@ which psql
 
 ### Permission Errors
 
-- Ensure database password has sufficient privileges
+- Ensure database user has sufficient privileges (postgres user recommended)
 - Service role key must have admin access for auth operations
 
 ### Timeout on Large Databases

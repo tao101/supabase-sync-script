@@ -91,16 +91,16 @@ export class SyncOrchestrator {
     logger.info('Validating connections...');
 
     // Create clients
-    this.sourcePool = createPostgresPool(this.config.source, true);
+    this.sourcePool = createPostgresPool(this.config.source);
     this.targetPool = createPostgresPool(this.config.target);
     this.sourceSupabase = createSupabaseClient(this.config.source);
     this.targetSupabase = createSupabaseClient(this.config.target);
 
     // Test source database
-    const sourceDbOk = await testPostgresConnection(this.sourcePool);
-    if (!sourceDbOk) {
+    const sourceDbResult = await testPostgresConnection(this.sourcePool);
+    if (!sourceDbResult.success) {
       throw new SyncError(
-        'Failed to connect to source database',
+        `Failed to connect to source database: ${sourceDbResult.error || 'Unknown error'}`,
         ErrorCategory.CONNECTION,
         'validate-connections',
         false
@@ -109,10 +109,10 @@ export class SyncOrchestrator {
     print.success('Source database connection OK');
 
     // Test target database
-    const targetDbOk = await testPostgresConnection(this.targetPool);
-    if (!targetDbOk) {
+    const targetDbResult = await testPostgresConnection(this.targetPool);
+    if (!targetDbResult.success) {
       throw new SyncError(
-        'Failed to connect to target database',
+        `Failed to connect to target database: ${targetDbResult.error || 'Unknown error'}`,
         ErrorCategory.CONNECTION,
         'validate-connections',
         false

@@ -4,19 +4,18 @@ export const ConnectionTypeSchema = z.enum(['saas', 'self-hosted', 'local']);
 export type ConnectionType = z.infer<typeof ConnectionTypeSchema>;
 
 export const SupabaseConnectionSchema = z.object({
-  type: ConnectionTypeSchema,
-  // For SaaS
-  projectRef: z.string().optional(),
-  // For self-hosted/local
-  host: z.string().optional(),
-  port: z.number().default(5432),
-  // Common
-  dbPassword: z.string(),
+  type: ConnectionTypeSchema.optional(),
+  // Database URL (primary connection method)
+  dbUrl: z.string(),
+  // Supabase API
+  apiUrl: z.string().url(),
   serviceRoleKey: z.string(),
   anonKey: z.string().optional(),
-  // API URLs (computed or provided)
-  apiUrl: z.string().url().optional(),
-  dbUrl: z.string().optional(),
+  // Legacy fields (optional, for backwards compatibility)
+  projectRef: z.string().optional(),
+  host: z.string().optional(),
+  port: z.number().default(5432),
+  dbPassword: z.string().optional(),
 });
 
 export type SupabaseConnection = z.infer<typeof SupabaseConnectionSchema>;

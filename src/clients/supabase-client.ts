@@ -1,19 +1,11 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import type { SupabaseConnection } from '../types/config.js';
-import { ConnectionBuilder } from '../config/connection-builder.js';
 import { logger } from '../utils/logger.js';
 
-export function createSupabaseClient(
-  connection: SupabaseConnection,
-  useServiceRole: boolean = true
-): SupabaseClient {
-  const builder = new ConnectionBuilder();
-  const apiUrl = builder.buildApiUrl(connection);
-  const key = useServiceRole ? connection.serviceRoleKey : (connection.anonKey || connection.serviceRoleKey);
+export function createSupabaseClient(connection: SupabaseConnection): SupabaseClient {
+  logger.debug(`Creating Supabase client for ${connection.apiUrl}`);
 
-  logger.debug(`Creating Supabase client for ${apiUrl}`);
-
-  return createClient(apiUrl, key, {
+  return createClient(connection.apiUrl, connection.serviceRoleKey, {
     auth: {
       autoRefreshToken: false,
       persistSession: false,

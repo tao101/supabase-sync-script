@@ -9,7 +9,7 @@ import {
   confirmDestructiveOperation,
   createSpinner,
 } from './modes/interactive-mode.js';
-import { loadCIConfig, printCISummary, logCIProgress } from './modes/ci-mode.js';
+import { loadCIConfig, printCISummary } from './modes/ci-mode.js';
 import { logger, setLogLevel, print } from './utils/logger.js';
 import { detectCIEnvironment } from './config/env.js';
 import { testPostgresConnection, createPostgresPool } from './clients/postgres-client.js';
@@ -90,10 +90,8 @@ program
 
         // Confirm destructive operation
         const builder = new ConnectionBuilder();
-        const targetDisplay = builder.getSafeDisplay(config.target);
-        const confirmed = await confirmDestructiveOperation(
-          `${targetDisplay.type} at ${targetDisplay.host || targetDisplay.projectRef || 'localhost'}`
-        );
+        const targetHost = builder.getHostFromDbUrl(config.target.dbUrl);
+        const confirmed = await confirmDestructiveOperation(targetHost);
 
         if (!confirmed) {
           print.warning('Sync cancelled by user');
@@ -187,27 +185,27 @@ program
       // Test source database
       const sourceSpinner = createSpinner('Testing source database...');
       sourceSpinner.start();
-      const sourcePool = createPostgresPool(config.source, true);
-      const sourceDbOk = await testPostgresConnection(sourcePool);
+      const sourcePool = createPostgresPool(config.source);
+      const sourceDbResult = await testPostgresConnection(sourcePool);
       await sourcePool.end();
 
-      if (sourceDbOk) {
+      if (sourceDbResult.success) {
         sourceSpinner.succeed('Source database: OK');
       } else {
-        sourceSpinner.fail('Source database: FAILED');
+        sourceSpinner.fail(`Source database: FAILED - ${sourceDbResult.error || 'Unknown error'}`);
       }
 
       // Test target database
       const targetSpinner = createSpinner('Testing target database...');
       targetSpinner.start();
       const targetPool = createPostgresPool(config.target);
-      const targetDbOk = await testPostgresConnection(targetPool);
+      const targetDbResult = await testPostgresConnection(targetPool);
       await targetPool.end();
 
-      if (targetDbOk) {
+      if (targetDbResult.success) {
         targetSpinner.succeed('Target database: OK');
       } else {
-        targetSpinner.fail('Target database: FAILED');
+        targetSpinner.fail(`Target database: FAILED - ${targetDbResult.error || 'Unknown error'}`);
       }
 
       // Test source Supabase API
@@ -235,7 +233,7 @@ program
       }
 
       // Summary
-      const allOk = sourceDbOk && targetDbOk && sourceApiOk && targetApiOk;
+      const allOk = sourceDbResult.success && targetDbResult.success && sourceApiOk && targetApiOk;
       console.log();
       if (allOk) {
         print.success('All connections successful!');
