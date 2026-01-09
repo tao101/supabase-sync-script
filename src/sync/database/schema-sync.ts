@@ -78,11 +78,17 @@ export class SchemaSync {
 
       // Check for actual errors in stderr
       if (result.stderr && result.stderr.trim()) {
-        const errorLines = result.stderr.split('\n').filter(line =>
-          line.includes('ERROR') && !line.includes('already exists')
-        );
+        const errorLines = result.stderr.split('\n').filter(line => {
+          if (!line.includes('ERROR')) return false;
+          // Filter out expected errors
+          if (line.includes('already exists')) return false;
+          if (line.includes('must be owner of')) return false; // System tables owned by supabase_admin
+          if (line.includes('current transaction is aborted')) return false; // Cascading from other errors
+          if (line.includes('permission denied')) return false; // System table permissions
+          return true;
+        });
         if (errorLines.length > 0) {
-          logger.warn(`Schema import had ${errorLines.length} errors (some may be expected):`);
+          logger.warn(`Schema import had ${errorLines.length} errors:`);
           errorLines.slice(0, 5).forEach(line => logger.warn(`  ${line.trim()}`));
           if (errorLines.length > 5) {
             logger.warn(`  ... and ${errorLines.length - 5} more errors`);
