@@ -1,10 +1,10 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
-import type { Config } from '../types/config.js';
+import type { Config, SupabaseConnection } from '../types/config.js';
 import { SyncStep, SyncResult, StepResult, SyncError, ErrorCategory } from '../types/sync.js';
 import { logger, print } from '../utils/logger.js';
 import { TempFileManager } from '../utils/temp-files.js';
 import { createSupabaseClient, testSupabaseConnection } from '../clients/supabase-client.js';
-import { createPostgresPool, testPostgresConnection, PostgresPool } from '../clients/postgres-client.js';
+import { createPostgresPool, testPostgresConnection, PostgresPool, setSslPreference } from '../clients/postgres-client.js';
 import { SchemaSync, DataSync, SequenceSync, RolesSync } from '../sync/database/index.js';
 import { AuthSync } from '../sync/auth/index.js';
 import { StorageSync } from '../sync/storage/index.js';
@@ -91,38 +91,71 @@ export class SyncOrchestrator {
     }
   }
 
+  private async createPoolWithSslFallback(
+    connection: SupabaseConnection,
+    label: string
+  ): Promise<PostgresPool> {
+    // First try with SSL (default behavior)
+    let pool = createPostgresPool(connection);
+    const result = await testPostgresConnection(pool);
+
+    if (result.success) {
+      return pool;
+    }
+
+    // If SSL error, retry without SSL
+    if (result.error && result.error.includes('SSL')) {
+      logger.info(`${label}: SSL not supported, retrying without SSL...`);
+      await pool.end();
+
+      // Remember this host doesn't support SSL
+      setSslPreference(connection.dbUrl, false);
+
+      pool = createPostgresPool(connection, true);
+      const retryResult = await testPostgresConnection(pool);
+
+      if (retryResult.success) {
+        logger.info(`${label}: Connected successfully without SSL`);
+        return pool;
+      }
+
+      await pool.end();
+      throw new SyncError(
+        `Failed to connect to ${label}: ${retryResult.error || 'Unknown error'}`,
+        ErrorCategory.CONNECTION,
+        'validate-connections',
+        false
+      );
+    }
+
+    await pool.end();
+    throw new SyncError(
+      `Failed to connect to ${label}: ${result.error || 'Unknown error'}`,
+      ErrorCategory.CONNECTION,
+      'validate-connections',
+      false
+    );
+  }
+
   private async validateConnections(): Promise<void> {
     logger.info('Validating connections...');
 
-    // Create clients
-    this.sourcePool = createPostgresPool(this.config.source);
-    this.targetPool = createPostgresPool(this.config.target);
-    this.sourceSupabase = createSupabaseClient(this.config.source);
-    this.targetSupabase = createSupabaseClient(this.config.target);
-
-    // Test source database
-    const sourceDbResult = await testPostgresConnection(this.sourcePool);
-    if (!sourceDbResult.success) {
-      throw new SyncError(
-        `Failed to connect to source database: ${sourceDbResult.error || 'Unknown error'}`,
-        ErrorCategory.CONNECTION,
-        'validate-connections',
-        false
-      );
-    }
+    // Create and test database pools with SSL fallback
+    this.sourcePool = await this.createPoolWithSslFallback(
+      this.config.source,
+      'source database'
+    );
     print.success('Source database connection OK');
 
-    // Test target database
-    const targetDbResult = await testPostgresConnection(this.targetPool);
-    if (!targetDbResult.success) {
-      throw new SyncError(
-        `Failed to connect to target database: ${targetDbResult.error || 'Unknown error'}`,
-        ErrorCategory.CONNECTION,
-        'validate-connections',
-        false
-      );
-    }
+    this.targetPool = await this.createPoolWithSslFallback(
+      this.config.target,
+      'target database'
+    );
     print.success('Target database connection OK');
+
+    // Create Supabase clients
+    this.sourceSupabase = createSupabaseClient(this.config.source);
+    this.targetSupabase = createSupabaseClient(this.config.target);
 
     // Test source Supabase API
     const sourceApiOk = await testSupabaseConnection(this.sourceSupabase);

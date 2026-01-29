@@ -9,7 +9,7 @@ import {
   confirmDestructiveOperation,
   createSpinner,
 } from './modes/interactive-mode.js';
-import { loadCIConfig, printCISummary } from './modes/ci-mode.js';
+import { loadCIConfig, printCISummary, logCIConnectionTest, printCIValidationResult } from './modes/ci-mode.js';
 import { logger, setLogLevel, print } from './utils/logger.js';
 import { detectCIEnvironment } from './config/env.js';
 import { testPostgresConnection, createPostgresPool } from './clients/postgres-client.js';
@@ -142,24 +142,36 @@ program
   .command('validate')
   .description('Validate configuration without syncing')
   .option('-c, --config <path>', 'Path to config file')
+  .option('--ci', 'Run in CI mode (non-interactive)')
   .action(async (options) => {
     try {
+      const isCI = options.ci || detectCIEnvironment();
       const config = await loadConfig({ configPath: options.config });
       const errors = validateConfig(config);
 
       if (errors.length > 0) {
-        print.error('Configuration validation failed:');
-        errors.forEach(e => console.log(chalk.red(`  - ${e}`)));
+        if (isCI) {
+          printCIValidationResult(false, errors);
+        } else {
+          print.error('Configuration validation failed:');
+          errors.forEach(e => console.log(chalk.red(`  - ${e}`)));
+        }
         process.exit(1);
       }
 
-      print.success('Configuration is valid');
-
-      // Show summary
       const builder = new ConnectionBuilder();
-      console.log('\nSource:', builder.getSafeDisplay(config.source));
-      console.log('Target:', builder.getSafeDisplay(config.target));
-      console.log('Components:', config.options.components);
+
+      if (isCI) {
+        printCIValidationResult(true, []);
+        console.log(`Source: ${builder.getSafeDisplay(config.source)}`);
+        console.log(`Target: ${builder.getSafeDisplay(config.target)}`);
+        console.log(`Components: ${JSON.stringify(config.options.components)}`);
+      } else {
+        print.success('Configuration is valid');
+        console.log('\nSource:', builder.getSafeDisplay(config.source));
+        console.log('Target:', builder.getSafeDisplay(config.target));
+        console.log('Components:', config.options.components);
+      }
     } catch (error) {
       print.error(`Validation failed: ${(error as Error).message}`);
       process.exit(1);
@@ -170,76 +182,131 @@ program
   .command('test-connection')
   .description('Test connections to source and target')
   .option('-c, --config <path>', 'Path to config file')
+  .option('--ci', 'Run in CI mode (non-interactive)')
   .action(async (options) => {
     try {
+      const isCI = options.ci || detectCIEnvironment();
       let config;
 
-      if (options.config || detectCIEnvironment()) {
+      if (options.config || isCI) {
         config = await loadConfig({ configPath: options.config });
       } else {
         config = await gatherFullConfig();
       }
 
-      print.header('Testing Connections');
-
-      // Test source database
-      const sourceSpinner = createSpinner('Testing source database...');
-      sourceSpinner.start();
-      const sourcePool = createPostgresPool(config.source);
-      const sourceDbResult = await testPostgresConnection(sourcePool);
-      await sourcePool.end();
-
-      if (sourceDbResult.success) {
-        sourceSpinner.succeed('Source database: OK');
-      } else {
-        sourceSpinner.fail(`Source database: FAILED - ${sourceDbResult.error || 'Unknown error'}`);
-      }
-
-      // Test target database
-      const targetSpinner = createSpinner('Testing target database...');
-      targetSpinner.start();
-      const targetPool = createPostgresPool(config.target);
-      const targetDbResult = await testPostgresConnection(targetPool);
-      await targetPool.end();
-
-      if (targetDbResult.success) {
-        targetSpinner.succeed('Target database: OK');
-      } else {
-        targetSpinner.fail(`Target database: FAILED - ${targetDbResult.error || 'Unknown error'}`);
-      }
-
-      // Test source Supabase API
-      const sourceApiSpinner = createSpinner('Testing source Supabase API...');
-      sourceApiSpinner.start();
-      const sourceSupabase = createSupabaseClient(config.source);
-      const sourceApiOk = await testSupabaseConnection(sourceSupabase);
-
-      if (sourceApiOk) {
-        sourceApiSpinner.succeed('Source Supabase API: OK');
-      } else {
-        sourceApiSpinner.fail('Source Supabase API: FAILED');
-      }
-
-      // Test target Supabase API
-      const targetApiSpinner = createSpinner('Testing target Supabase API...');
-      targetApiSpinner.start();
-      const targetSupabase = createSupabaseClient(config.target);
-      const targetApiOk = await testSupabaseConnection(targetSupabase);
-
-      if (targetApiOk) {
-        targetApiSpinner.succeed('Target Supabase API: OK');
-      } else {
-        targetApiSpinner.fail('Target Supabase API: FAILED');
-      }
-
-      // Summary
-      const allOk = sourceDbResult.success && targetDbResult.success && sourceApiOk && targetApiOk;
-      console.log();
-      if (allOk) {
-        print.success('All connections successful!');
-      } else {
-        print.error('Some connections failed');
+      // Validate config (especially important now that serviceRoleKey is optional)
+      const errors = validateConfig(config);
+      if (errors.length > 0) {
+        print.error('Configuration validation failed:');
+        errors.forEach(e => print.error(`  - ${e}`));
         process.exit(1);
+      }
+
+      if (isCI) {
+        // CI mode - use plain text output without spinners
+        console.log('Testing Connections');
+        console.log('='.repeat(40));
+
+        // Test source database
+        logCIConnectionTest('Source database', 'testing');
+        const sourcePool = createPostgresPool(config.source);
+        const sourceDbResult = await testPostgresConnection(sourcePool);
+        await sourcePool.end();
+        logCIConnectionTest('Source database', sourceDbResult.success ? 'success' : 'failed',
+          sourceDbResult.success ? undefined : sourceDbResult.error || 'Unknown error');
+
+        // Test target database
+        logCIConnectionTest('Target database', 'testing');
+        const targetPool = createPostgresPool(config.target);
+        const targetDbResult = await testPostgresConnection(targetPool);
+        await targetPool.end();
+        logCIConnectionTest('Target database', targetDbResult.success ? 'success' : 'failed',
+          targetDbResult.success ? undefined : targetDbResult.error || 'Unknown error');
+
+        // Test source Supabase API
+        logCIConnectionTest('Source Supabase API', 'testing');
+        const sourceSupabase = createSupabaseClient(config.source);
+        const sourceApiOk = await testSupabaseConnection(sourceSupabase);
+        logCIConnectionTest('Source Supabase API', sourceApiOk ? 'success' : 'failed');
+
+        // Test target Supabase API
+        logCIConnectionTest('Target Supabase API', 'testing');
+        const targetSupabase = createSupabaseClient(config.target);
+        const targetApiOk = await testSupabaseConnection(targetSupabase);
+        logCIConnectionTest('Target Supabase API', targetApiOk ? 'success' : 'failed');
+
+        // Summary
+        const allOk = sourceDbResult.success && targetDbResult.success && sourceApiOk && targetApiOk;
+        console.log('='.repeat(40));
+        if (allOk) {
+          console.log('[OK] All connections successful');
+        } else {
+          console.log('[FAILED] Some connections failed');
+          process.exit(1);
+        }
+      } else {
+        // Interactive mode - use spinners
+        print.header('Testing Connections');
+
+        // Test source database
+        const sourceSpinner = createSpinner('Testing source database...');
+        sourceSpinner.start();
+        const sourcePool = createPostgresPool(config.source);
+        const sourceDbResult = await testPostgresConnection(sourcePool);
+        await sourcePool.end();
+
+        if (sourceDbResult.success) {
+          sourceSpinner.succeed('Source database: OK');
+        } else {
+          sourceSpinner.fail(`Source database: FAILED - ${sourceDbResult.error || 'Unknown error'}`);
+        }
+
+        // Test target database
+        const targetSpinner = createSpinner('Testing target database...');
+        targetSpinner.start();
+        const targetPool = createPostgresPool(config.target);
+        const targetDbResult = await testPostgresConnection(targetPool);
+        await targetPool.end();
+
+        if (targetDbResult.success) {
+          targetSpinner.succeed('Target database: OK');
+        } else {
+          targetSpinner.fail(`Target database: FAILED - ${targetDbResult.error || 'Unknown error'}`);
+        }
+
+        // Test source Supabase API
+        const sourceApiSpinner = createSpinner('Testing source Supabase API...');
+        sourceApiSpinner.start();
+        const sourceSupabase = createSupabaseClient(config.source);
+        const sourceApiOk = await testSupabaseConnection(sourceSupabase);
+
+        if (sourceApiOk) {
+          sourceApiSpinner.succeed('Source Supabase API: OK');
+        } else {
+          sourceApiSpinner.fail('Source Supabase API: FAILED');
+        }
+
+        // Test target Supabase API
+        const targetApiSpinner = createSpinner('Testing target Supabase API...');
+        targetApiSpinner.start();
+        const targetSupabase = createSupabaseClient(config.target);
+        const targetApiOk = await testSupabaseConnection(targetSupabase);
+
+        if (targetApiOk) {
+          targetApiSpinner.succeed('Target Supabase API: OK');
+        } else {
+          targetApiSpinner.fail('Target Supabase API: FAILED');
+        }
+
+        // Summary
+        const allOk = sourceDbResult.success && targetDbResult.success && sourceApiOk && targetApiOk;
+        console.log();
+        if (allOk) {
+          print.success('All connections successful!');
+        } else {
+          print.error('Some connections failed');
+          process.exit(1);
+        }
       }
     } catch (error) {
       print.error(`Connection test failed: ${(error as Error).message}`);

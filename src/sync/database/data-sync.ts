@@ -149,13 +149,18 @@ export class DataSync {
       });
 
       if (result.stderr && result.stderr.trim()) {
-        const errorLines = result.stderr.split('\n').filter(line =>
-          line.includes('ERROR') || line.includes('error')
-        );
+        const errorLines = result.stderr.split('\n').filter(line => {
+          if (!line.includes('ERROR')) return false;
+          // Filter out expected errors for system tables
+          if (line.includes('must be owner of')) return false; // System tables owned by supabase_admin
+          if (line.includes('permission denied')) return false; // System table permissions
+          return true;
+        });
         if (errorLines.length > 0) {
-          logger.warn(`Data import had errors:\n${errorLines.slice(0, 10).join('\n')}`);
+          logger.warn(`Data import had ${errorLines.length} errors:`);
+          errorLines.slice(0, 10).forEach(line => logger.warn(`  ${line.trim()}`));
           if (errorLines.length > 10) {
-            logger.warn(`... and ${errorLines.length - 10} more errors`);
+            logger.warn(`  ... and ${errorLines.length - 10} more errors`);
           }
         }
       }
@@ -192,11 +197,15 @@ export class DataSync {
 
       const mismatches: { table: string; source: number; target: number }[] = [];
 
+      // Tables that are intentionally excluded from sync (always empty on target)
+      const alwaysExcludedTables = ['auth.sessions', 'auth.refresh_tokens'];
+
       for (const row of tablesResult.rows) {
         const tableName = `${row.schemaname}.${row.tablename}`;
 
-        // Skip excluded tables
-        if (this.config.options.database.excludeTables.includes(tableName)) {
+        // Skip excluded tables and always-excluded tables
+        if (this.config.options.database.excludeTables.includes(tableName) ||
+            alwaysExcludedTables.includes(tableName)) {
           continue;
         }
 

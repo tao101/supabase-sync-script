@@ -1,13 +1,20 @@
 {
+  "_comment": "Use EITHER legacy keys (serviceRoleKey) OR new keys (secretKey), not both",
   "source": {
     "dbUrl": "postgresql://postgres:your-password@db.your-project.supabase.co:5432/postgres",
     "apiUrl": "https://your-project.supabase.co",
-    "serviceRoleKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+    "_keys_option_a": "Legacy JWT keys",
+    "serviceRoleKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "_keys_option_b": "New API keys (comment out serviceRoleKey and use secretKey instead)",
+    "_secretKey": "sb_secret_..."
   },
   "target": {
     "dbUrl": "postgresql://postgres:your-password@your-server.com:5432/postgres",
     "apiUrl": "https://supabase.your-server.com",
-    "serviceRoleKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+    "_keys_option_a": "Legacy JWT keys",
+    "serviceRoleKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "_keys_option_b": "New API keys (comment out serviceRoleKey and use secretKey instead)",
+    "_secretKey": "sb_secret_..."
   },
   "options": {
     "components": {

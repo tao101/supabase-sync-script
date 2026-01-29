@@ -9,8 +9,12 @@ export const SupabaseConnectionSchema = z.object({
   dbUrl: z.string(),
   // Supabase API
   apiUrl: z.string().url(),
-  serviceRoleKey: z.string(),
+  // Legacy keys (JWT format) - use either legacy OR new keys, not both
+  serviceRoleKey: z.string().optional(),
   anonKey: z.string().optional(),
+  // New keys (sb_secret_/sb_publishable_ format) - use either legacy OR new keys, not both
+  secretKey: z.string().optional(),
+  publishableKey: z.string().optional(),
   // Legacy fields (optional, for backwards compatibility)
   projectRef: z.string().optional(),
   host: z.string().optional(),

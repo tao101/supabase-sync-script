@@ -2,10 +2,17 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import type { SupabaseConnection } from '../types/config.js';
 import { logger } from '../utils/logger.js';
 
-export function createSupabaseClient(connection: SupabaseConnection): SupabaseClient {
-  logger.debug(`Creating Supabase client for ${connection.apiUrl}`);
+// Get the effective API key (new secretKey or legacy serviceRoleKey)
+function getEffectiveApiKey(connection: SupabaseConnection): string {
+  return connection.secretKey || connection.serviceRoleKey || '';
+}
 
-  return createClient(connection.apiUrl, connection.serviceRoleKey, {
+export function createSupabaseClient(connection: SupabaseConnection): SupabaseClient {
+  const apiKey = getEffectiveApiKey(connection);
+  const keyType = connection.secretKey ? 'secret key' : 'service role key';
+  logger.debug(`Creating Supabase client for ${connection.apiUrl} using ${keyType}`);
+
+  return createClient(connection.apiUrl, apiKey, {
     auth: {
       autoRefreshToken: false,
       persistSession: false,
