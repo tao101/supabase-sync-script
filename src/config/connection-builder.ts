@@ -67,9 +67,8 @@ export class ConnectionBuilder {
       errors.push('API URL must start with http:// or https://');
     }
 
-    if (!config.serviceRoleKey && !config.secretKey) {
-      errors.push('API key is required (serviceRoleKey or secretKey)');
-    }
+    // Note: Key validation (serviceRoleKey vs secretKey) is handled by validateKeyPair()
+    // in config/index.ts to avoid duplicate error messages
 
     return errors;
   }
