@@ -172,14 +172,13 @@ export class SyncOrchestrator {
   }
 
   private async syncAuth(): Promise<void> {
-    if (!this.sourcePool || !this.targetPool || !this.targetSupabase) {
+    if (!this.sourcePool || !this.targetPool) {
       throw new Error('Clients not initialized');
     }
     const authSync = new AuthSync(
       this.config,
       this.sourcePool,
-      this.targetPool,
-      this.targetSupabase
+      this.targetPool
     );
     await authSync.sync();
   }

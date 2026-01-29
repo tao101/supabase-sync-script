@@ -1,4 +1,3 @@
-import type { SupabaseClient } from '@supabase/supabase-js';
 import type pg from 'pg';
 import type { Config } from '../../types/config.js';
 import { logger } from '../../utils/logger.js';
@@ -9,8 +8,7 @@ export class AuthSync {
   constructor(
     private config: Config,
     private sourcePool: PostgresPool,
-    private targetPool: PostgresPool,
-    private targetSupabase: SupabaseClient
+    private targetPool: PostgresPool
   ) {}
 
   async exportUsers(): Promise<AuthUser[]> {
