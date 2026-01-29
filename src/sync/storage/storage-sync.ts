@@ -4,6 +4,7 @@ import type { Config } from '../../types/config.js';
 import type { PostgresPool } from '../../clients/postgres-client.js';
 import { logger } from '../../utils/logger.js';
 import { StorageSyncResult, BucketSyncResult, StorageBucket, StorageFile } from '../../types/sync.js';
+import { withRetry } from '../../utils/retry.js';
 
 export class StorageSync {
   constructor(
@@ -16,11 +17,18 @@ export class StorageSync {
   async listBuckets(): Promise<StorageBucket[]> {
     logger.info('Listing storage buckets from source...');
 
-    const { data, error } = await this.sourceSupabase.storage.listBuckets();
+    const data = await withRetry(
+      async () => {
+        const { data, error } = await this.sourceSupabase.storage.listBuckets();
 
-    if (error) {
-      throw new Error(`Failed to list buckets: ${error.message}`);
-    }
+        if (error) {
+          throw new Error(`Failed to list buckets: ${error.message}`);
+        }
+
+        return data;
+      },
+      { maxAttempts: 3, baseDelayMs: 2000 }
+    );
 
     // Filter out excluded buckets
     const filtered = (data || []).filter(
@@ -88,30 +96,35 @@ export class StorageSync {
   }
 
   async syncFile(bucketName: string, filePath: string): Promise<void> {
-    // Download from source
-    const { data: fileData, error: downloadError } = await this.sourceSupabase.storage
-      .from(bucketName)
-      .download(filePath);
+    await withRetry(
+      async () => {
+        // Download from source
+        const { data: fileData, error: downloadError } = await this.sourceSupabase.storage
+          .from(bucketName)
+          .download(filePath);
 
-    if (downloadError) {
-      throw new Error(`Failed to download ${bucketName}/${filePath}: ${downloadError.message}`);
-    }
+        if (downloadError) {
+          throw new Error(`Failed to download ${bucketName}/${filePath}: ${downloadError.message}`);
+        }
 
-    if (!fileData) {
-      throw new Error(`No data returned for ${bucketName}/${filePath}`);
-    }
+        if (!fileData) {
+          throw new Error(`No data returned for ${bucketName}/${filePath}`);
+        }
 
-    // Upload to target
-    const { error: uploadError } = await this.targetSupabase.storage
-      .from(bucketName)
-      .upload(filePath, fileData, {
-        upsert: true,
-        contentType: fileData.type || 'application/octet-stream',
-      });
+        // Upload to target
+        const { error: uploadError } = await this.targetSupabase.storage
+          .from(bucketName)
+          .upload(filePath, fileData, {
+            upsert: true,
+            contentType: fileData.type || 'application/octet-stream',
+          });
 
-    if (uploadError) {
-      throw new Error(`Failed to upload ${bucketName}/${filePath}: ${uploadError.message}`);
-    }
+        if (uploadError) {
+          throw new Error(`Failed to upload ${bucketName}/${filePath}: ${uploadError.message}`);
+        }
+      },
+      { maxAttempts: 3, baseDelayMs: 1000 }
+    );
   }
 
   async syncBucket(bucket: StorageBucket): Promise<BucketSyncResult> {
