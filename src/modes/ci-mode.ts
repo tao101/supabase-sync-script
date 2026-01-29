@@ -41,6 +41,34 @@ export function logCIProgress(step: string, status: 'start' | 'success' | 'error
   }
 }
 
+export function logCIConnectionTest(
+  name: string,
+  status: 'testing' | 'success' | 'failed',
+  message?: string
+): void {
+  const timestamp = new Date().toISOString();
+  switch (status) {
+    case 'testing':
+      console.log(`[${timestamp}] [TESTING] ${name}`);
+      break;
+    case 'success':
+      console.log(`[${timestamp}] [OK] ${name}${message ? `: ${message}` : ''}`);
+      break;
+    case 'failed':
+      console.log(`[${timestamp}] [FAILED] ${name}${message ? `: ${message}` : ''}`);
+      break;
+  }
+}
+
+export function printCIValidationResult(isValid: boolean, errors: string[]): void {
+  if (isValid) {
+    console.log('[OK] Configuration is valid');
+  } else {
+    console.log('[ERROR] Configuration validation failed:');
+    errors.forEach(e => console.log(`  - ${e}`));
+  }
+}
+
 export function printCISummary(results: {
   success: boolean;
   duration: number;
