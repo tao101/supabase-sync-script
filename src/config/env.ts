@@ -32,8 +32,12 @@ export function loadSourceFromEnv(): Partial<SupabaseConnection> {
   return {
     dbUrl: getEnvVar('SOURCE_DB_URL'),
     apiUrl: getEnvVar('SOURCE_API_URL'),
+    // Legacy keys (JWT format)
     serviceRoleKey: getEnvVar('SOURCE_SERVICE_ROLE_KEY'),
     anonKey: getEnvVar('SOURCE_ANON_KEY'),
+    // New keys (sb_secret_/sb_publishable_ format)
+    secretKey: getEnvVar('SOURCE_SECRET_KEY'),
+    publishableKey: getEnvVar('SOURCE_PUBLISHABLE_KEY'),
   };
 }
 
@@ -41,8 +45,12 @@ export function loadTargetFromEnv(): Partial<SupabaseConnection> {
   return {
     dbUrl: getEnvVar('TARGET_DB_URL'),
     apiUrl: getEnvVar('TARGET_API_URL'),
+    // Legacy keys (JWT format)
     serviceRoleKey: getEnvVar('TARGET_SERVICE_ROLE_KEY'),
     anonKey: getEnvVar('TARGET_ANON_KEY'),
+    // New keys (sb_secret_/sb_publishable_ format)
+    secretKey: getEnvVar('TARGET_SECRET_KEY'),
+    publishableKey: getEnvVar('TARGET_PUBLISHABLE_KEY'),
   };
 }
 

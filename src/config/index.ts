@@ -138,6 +138,83 @@ export async function loadConfig(options: {
   return result.data;
 }
 
+// Key validation helpers - exported for use in other modules
+export function isLegacyJwtKey(key: string): boolean {
+  return key.split('.').length === 3;
+}
+
+export function isNewSecretKey(key: string): boolean {
+  return key.startsWith('sb_secret_');
+}
+
+export function isNewPublishableKey(key: string): boolean {
+  return key.startsWith('sb_publishable_');
+}
+
+export function isValidApiKey(key: string): boolean {
+  return isLegacyJwtKey(key) || isNewSecretKey(key);
+}
+
+type KeyType = 'legacy' | 'new' | 'mixed' | 'missing';
+
+function detectKeyType(connection: SupabaseConnection): KeyType {
+  const hasLegacyServiceKey = !!connection.serviceRoleKey;
+  const hasLegacyAnonKey = !!connection.anonKey;
+  const hasNewSecretKey = !!connection.secretKey;
+  const hasNewPublishableKey = !!connection.publishableKey;
+
+  const hasLegacy = hasLegacyServiceKey || hasLegacyAnonKey;
+  const hasNew = hasNewSecretKey || hasNewPublishableKey;
+
+  if (hasLegacy && hasNew) {
+    return 'mixed';
+  }
+  if (hasLegacyServiceKey) {
+    return 'legacy';
+  }
+  if (hasNewSecretKey) {
+    return 'new';
+  }
+  return 'missing';
+}
+
+function validateKeyPair(connection: SupabaseConnection, prefix: string): string[] {
+  const errors: string[] = [];
+  const keyType = detectKeyType(connection);
+
+  switch (keyType) {
+    case 'mixed':
+      errors.push(`${prefix}: Cannot mix legacy keys (serviceRoleKey/anonKey) with new keys (secretKey/publishableKey). Use one pair or the other.`);
+      break;
+
+    case 'missing':
+      errors.push(`${prefix}: Either serviceRoleKey (legacy) or secretKey (new) is required`);
+      break;
+
+    case 'legacy':
+      // Validate legacy JWT format
+      if (connection.serviceRoleKey && !isLegacyJwtKey(connection.serviceRoleKey)) {
+        errors.push(`${prefix}: Service role key appears invalid (not a JWT format)`);
+      }
+      if (connection.anonKey && !isLegacyJwtKey(connection.anonKey)) {
+        errors.push(`${prefix}: Anon key appears invalid (not a JWT format)`);
+      }
+      break;
+
+    case 'new':
+      // Validate new key format
+      if (connection.secretKey && !isNewSecretKey(connection.secretKey)) {
+        errors.push(`${prefix}: Secret key must start with 'sb_secret_'`);
+      }
+      if (connection.publishableKey && !isNewPublishableKey(connection.publishableKey)) {
+        errors.push(`${prefix}: Publishable key must start with 'sb_publishable_'`);
+      }
+      break;
+  }
+
+  return errors;
+}
+
 export function validateConfig(config: Config): string[] {
   const errors: string[] = [];
   const builder = new ConnectionBuilder();
@@ -150,28 +227,9 @@ export function validateConfig(config: Config): string[] {
   const targetErrors = builder.validateConnection(config.target);
   errors.push(...targetErrors.map(e => `Target: ${e}`));
 
-  // Validate service role key format
-  if (config.source.serviceRoleKey) {
-    try {
-      const parts = config.source.serviceRoleKey.split('.');
-      if (parts.length !== 3) {
-        errors.push('Source: Service role key appears invalid (not a JWT)');
-      }
-    } catch {
-      errors.push('Source: Service role key appears invalid');
-    }
-  }
-
-  if (config.target.serviceRoleKey) {
-    try {
-      const parts = config.target.serviceRoleKey.split('.');
-      if (parts.length !== 3) {
-        errors.push('Target: Service role key appears invalid (not a JWT)');
-      }
-    } catch {
-      errors.push('Target: Service role key appears invalid');
-    }
-  }
+  // Validate key pairs for source and target
+  errors.push(...validateKeyPair(config.source, 'Source'));
+  errors.push(...validateKeyPair(config.target, 'Target'));
 
   return errors;
 }

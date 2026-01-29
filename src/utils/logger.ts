@@ -34,7 +34,7 @@ export function setLogLevel(level: string): void {
 
 // Sanitize sensitive data before logging
 export function sanitizeConfig(config: Record<string, unknown>): Record<string, unknown> {
-  const sensitiveKeys = ['password', 'serviceRoleKey', 'anonKey', 'dbPassword', 'secret', 'token'];
+  const sensitiveKeys = ['password', 'serviceRoleKey', 'anonKey', 'dbPassword', 'secret', 'token', 'secretKey', 'publishableKey'];
 
   const sanitize = (obj: Record<string, unknown>): Record<string, unknown> => {
     const result: Record<string, unknown> = {};

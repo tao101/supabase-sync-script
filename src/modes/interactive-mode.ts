@@ -5,6 +5,14 @@ import type { Config, SupabaseConnection } from '../types/config.js';
 import { print } from '../utils/logger.js';
 import { createPostgresPool, testPostgresConnection, setSslPreference } from '../clients/postgres-client.js';
 import { createSupabaseClient, testSupabaseConnection } from '../clients/supabase-client.js';
+import { isLegacyJwtKey, isNewSecretKey, isValidApiKey } from '../config/index.js';
+
+// UI-specific helper
+function getKeyTypeLabel(key: string): string {
+  if (isNewSecretKey(key)) return 'secret key';
+  if (isLegacyJwtKey(key)) return 'service role key';
+  return 'unknown key type';
+}
 
 async function testDatabaseUrl(dbUrl: string): Promise<boolean> {
   const spinner = ora('Testing database connection...').start();
@@ -48,22 +56,32 @@ async function testDatabaseUrl(dbUrl: string): Promise<boolean> {
   }
 }
 
-async function testSupabaseApi(apiUrl: string, serviceRoleKey: string): Promise<boolean> {
-  const spinner = ora('Testing Supabase API connection...').start();
+async function testSupabaseApi(apiUrl: string, apiKey: string): Promise<boolean> {
+  const keyType = getKeyTypeLabel(apiKey);
+  const spinner = ora(`Testing Supabase API connection with ${keyType}...`).start();
 
   try {
-    const client = createSupabaseClient({
+    // Build connection based on key type
+    const connection: SupabaseConnection = {
       dbUrl: '',
       apiUrl,
-      serviceRoleKey
-    } as SupabaseConnection);
+      port: 5432,
+    } as SupabaseConnection;
+
+    if (isNewSecretKey(apiKey)) {
+      connection.secretKey = apiKey;
+    } else {
+      connection.serviceRoleKey = apiKey;
+    }
+
+    const client = createSupabaseClient(connection);
     const success = await testSupabaseConnection(client);
 
     if (success) {
-      spinner.succeed('Supabase API connection successful');
+      spinner.succeed(`Supabase API connection successful (using ${keyType})`);
       return true;
     } else {
-      spinner.fail('Supabase API connection failed - check your service role key');
+      spinner.fail(`Supabase API connection failed - check your ${keyType}`);
       return false;
     }
   } catch (error) {
@@ -145,16 +163,18 @@ export async function gatherSourceConfig(): Promise<SupabaseConnection> {
     },
   }]);
 
-  const serviceRoleKey = await promptWithRetry(
+  const apiKey = await promptWithRetry(
     async () => {
       const { key } = await inquirer.prompt([{
         type: 'password',
         name: 'key',
-        message: 'Enter source service role key:',
+        message: 'Enter source API key (service_role key or sb_secret_... key):',
         mask: '*',
         validate: (input: string) => {
-          if (!input) return 'Service role key is required';
-          if (!input.includes('.')) return 'Invalid service role key format';
+          if (!input) return 'API key is required';
+          if (!isValidApiKey(input)) {
+            return 'Invalid key format. Use JWT (legacy service_role) or sb_secret_... (new format)';
+          }
           return true;
         },
       }]);
@@ -163,12 +183,20 @@ export async function gatherSourceConfig(): Promise<SupabaseConnection> {
     async (key) => testSupabaseApi(apiUrl, key)
   );
 
-  return {
+  // Return connection with appropriate key field based on format
+  const connection: SupabaseConnection = {
     dbUrl,
     apiUrl,
-    serviceRoleKey,
     port: 5432,
-  };
+  } as SupabaseConnection;
+
+  if (isNewSecretKey(apiKey)) {
+    connection.secretKey = apiKey;
+  } else {
+    connection.serviceRoleKey = apiKey;
+  }
+
+  return connection;
 }
 
 export async function gatherTargetConfig(): Promise<SupabaseConnection> {
@@ -212,16 +240,18 @@ export async function gatherTargetConfig(): Promise<SupabaseConnection> {
     },
   }]);
 
-  const serviceRoleKey = await promptWithRetry(
+  const apiKey = await promptWithRetry(
     async () => {
       const { key } = await inquirer.prompt([{
         type: 'password',
         name: 'key',
-        message: 'Enter target service role key:',
+        message: 'Enter target API key (service_role key or sb_secret_... key):',
         mask: '*',
         validate: (input: string) => {
-          if (!input) return 'Service role key is required';
-          if (!input.includes('.')) return 'Invalid service role key format';
+          if (!input) return 'API key is required';
+          if (!isValidApiKey(input)) {
+            return 'Invalid key format. Use JWT (legacy service_role) or sb_secret_... (new format)';
+          }
           return true;
         },
       }]);
@@ -230,12 +260,20 @@ export async function gatherTargetConfig(): Promise<SupabaseConnection> {
     async (key) => testSupabaseApi(apiUrl, key)
   );
 
-  return {
+  // Return connection with appropriate key field based on format
+  const connection: SupabaseConnection = {
     dbUrl,
     apiUrl,
-    serviceRoleKey,
     port: 5432,
-  };
+  } as SupabaseConnection;
+
+  if (isNewSecretKey(apiKey)) {
+    connection.secretKey = apiKey;
+  } else {
+    connection.serviceRoleKey = apiKey;
+  }
+
+  return connection;
 }
 
 export async function gatherSyncOptions(): Promise<Partial<Config['options']>> {
