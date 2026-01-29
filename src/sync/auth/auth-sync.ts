@@ -85,6 +85,32 @@ export class AuthSync {
     }
   }
 
+  async disableConstraints(): Promise<void> {
+    logger.debug('Disabling triggers for auth import...');
+
+    const client = await this.targetPool.connect();
+    try {
+      // Disable trigger-based constraints (including FK triggers)
+      // This prevents triggers from firing when we insert users
+      await client.query('SET session_replication_role = replica;');
+      await client.query('SET CONSTRAINTS ALL DEFERRED;');
+    } finally {
+      client.release();
+    }
+  }
+
+  async enableConstraints(): Promise<void> {
+    logger.debug('Re-enabling triggers after auth import...');
+
+    const client = await this.targetPool.connect();
+    try {
+      await client.query('SET session_replication_role = DEFAULT;');
+      await client.query('SET CONSTRAINTS ALL IMMEDIATE;');
+    } finally {
+      client.release();
+    }
+  }
+
   async importUser(user: AuthUser): Promise<void> {
     // Use Admin API to create user with preserved password hash
     try {
@@ -213,30 +239,39 @@ export class AuthSync {
     // Clear target
     await this.clearTargetAuth();
 
-    // Import users
-    let usersImported = 0;
-    for (const user of users) {
-      try {
-        await this.importUserViaSql(user);
-        usersImported++;
-      } catch (error) {
-        const msg = `Failed to import user ${user.email || user.id}: ${(error as Error).message}`;
-        logger.warn(msg);
-        errors.push(msg);
-      }
-    }
+    // Disable triggers to prevent FK violations during import
+    await this.disableConstraints();
 
-    // Import identities
+    let usersImported = 0;
     let identitiesImported = 0;
-    for (const identity of identities) {
-      try {
-        await this.importIdentity(identity);
-        identitiesImported++;
-      } catch (error) {
-        const msg = `Failed to import identity ${identity.id}: ${(error as Error).message}`;
-        logger.warn(msg);
-        errors.push(msg);
+
+    try {
+      // Import users
+      for (const user of users) {
+        try {
+          await this.importUserViaSql(user);
+          usersImported++;
+        } catch (error) {
+          const msg = `Failed to import user ${user.email || user.id}: ${(error as Error).message}`;
+          logger.warn(msg);
+          errors.push(msg);
+        }
       }
+
+      // Import identities
+      for (const identity of identities) {
+        try {
+          await this.importIdentity(identity);
+          identitiesImported++;
+        } catch (error) {
+          const msg = `Failed to import identity ${identity.id}: ${(error as Error).message}`;
+          logger.warn(msg);
+          errors.push(msg);
+        }
+      }
+    } finally {
+      // Re-enable triggers
+      await this.enableConstraints();
     }
 
     logger.info(`Auth sync complete: ${usersImported}/${users.length} users, ${identitiesImported}/${identities.length} identities`);
