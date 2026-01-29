@@ -67,8 +67,8 @@ export class ConnectionBuilder {
       errors.push('API URL must start with http:// or https://');
     }
 
-    if (!config.serviceRoleKey) {
-      errors.push('Service role key is required');
+    if (!config.serviceRoleKey && !config.secretKey) {
+      errors.push('API key is required (serviceRoleKey or secretKey)');
     }
 
     return errors;

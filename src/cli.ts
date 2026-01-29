@@ -180,6 +180,14 @@ program
         config = await gatherFullConfig();
       }
 
+      // Validate config (especially important now that serviceRoleKey is optional)
+      const errors = validateConfig(config);
+      if (errors.length > 0) {
+        print.error('Configuration validation failed:');
+        errors.forEach(e => print.error(`  - ${e}`));
+        process.exit(1);
+      }
+
       print.header('Testing Connections');
 
       // Test source database

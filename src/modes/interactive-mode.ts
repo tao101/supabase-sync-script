@@ -5,20 +5,9 @@ import type { Config, SupabaseConnection } from '../types/config.js';
 import { print } from '../utils/logger.js';
 import { createPostgresPool, testPostgresConnection, setSslPreference } from '../clients/postgres-client.js';
 import { createSupabaseClient, testSupabaseConnection } from '../clients/supabase-client.js';
+import { isLegacyJwtKey, isNewSecretKey, isValidApiKey } from '../config/index.js';
 
-// Key format detection helpers
-function isLegacyJwtKey(key: string): boolean {
-  return key.split('.').length === 3;
-}
-
-function isNewSecretKey(key: string): boolean {
-  return key.startsWith('sb_secret_');
-}
-
-function isValidApiKey(key: string): boolean {
-  return isLegacyJwtKey(key) || isNewSecretKey(key);
-}
-
+// UI-specific helper
 function getKeyTypeLabel(key: string): string {
   if (isNewSecretKey(key)) return 'secret key';
   if (isLegacyJwtKey(key)) return 'service role key';

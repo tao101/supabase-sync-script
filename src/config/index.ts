@@ -138,17 +138,21 @@ export async function loadConfig(options: {
   return result.data;
 }
 
-// Key validation helpers
-function isLegacyJwtKey(key: string): boolean {
+// Key validation helpers - exported for use in other modules
+export function isLegacyJwtKey(key: string): boolean {
   return key.split('.').length === 3;
 }
 
-function isNewSecretKey(key: string): boolean {
+export function isNewSecretKey(key: string): boolean {
   return key.startsWith('sb_secret_');
 }
 
-function isNewPublishableKey(key: string): boolean {
+export function isNewPublishableKey(key: string): boolean {
   return key.startsWith('sb_publishable_');
+}
+
+export function isValidApiKey(key: string): boolean {
+  return isLegacyJwtKey(key) || isNewSecretKey(key);
 }
 
 type KeyType = 'legacy' | 'new' | 'mixed' | 'missing';
@@ -228,9 +232,4 @@ export function validateConfig(config: Config): string[] {
   errors.push(...validateKeyPair(config.target, 'Target'));
 
   return errors;
-}
-
-// Helper to get the effective API key (secretKey or serviceRoleKey)
-export function getEffectiveApiKey(connection: SupabaseConnection): string {
-  return connection.secretKey || connection.serviceRoleKey || '';
 }
