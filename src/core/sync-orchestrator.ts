@@ -234,10 +234,30 @@ export class SyncOrchestrator {
 
     if (!this.targetPool) return;
 
-    // Verify sequences
-    if (this.config.options.components.data) {
+    if (this.config.options.components.data && this.sourcePool) {
+      // Verify row counts - FAIL if mismatch
+      const dataSync = new DataSync(this.config, this.tempFileManager, this.targetPool);
+      const countsMatch = await dataSync.verifyDataCounts(this.sourcePool);
+      if (!countsMatch) {
+        throw new SyncError(
+          'Data verification failed: row counts do not match between source and target',
+          ErrorCategory.VALIDATION,
+          'verify',
+          false
+        );
+      }
+
+      // Verify sequences - FAIL if invalid
       const sequenceSync = new SequenceSync(this.config, this.targetPool);
-      await sequenceSync.verifySequences();
+      const sequencesValid = await sequenceSync.verifySequences();
+      if (!sequencesValid) {
+        throw new SyncError(
+          'Data verification failed: sequences are invalid',
+          ErrorCategory.VALIDATION,
+          'verify',
+          false
+        );
+      }
     }
 
     print.success('Verification complete');

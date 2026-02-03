@@ -184,7 +184,7 @@ export class DataSync {
     }
   }
 
-  async verifyDataCounts(sourcePool: PostgresPool): Promise<void> {
+  async verifyDataCounts(sourcePool: PostgresPool): Promise<boolean> {
     logger.info('Verifying data counts between source and target...');
 
     const sourceClient = await sourcePool.connect();
@@ -250,8 +250,10 @@ export class DataSync {
         if (mismatches.length > 20) {
           logger.warn(`  ... and ${mismatches.length - 20} more`);
         }
+        return false;
       } else {
         logger.info('All table row counts match between source and target');
+        return true;
       }
     } finally {
       sourceClient.release();
