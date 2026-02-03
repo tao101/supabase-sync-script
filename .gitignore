@@ -63,3 +63,7 @@ package-lock.json
 # SQL dump files (may contain sensitive data)
 *.sql
 !templates/*.sql
+
+# Development documentation (personal notes)
+/docs/brainstorms/
+/docs/plans/
