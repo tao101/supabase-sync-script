@@ -88,6 +88,7 @@ export interface StorageFile {
   id: string | null;
   bucket_id: string;
   metadata: Record<string, unknown>;
+  size: number; // File size in bytes
 }
 
 export interface BucketSyncResult {

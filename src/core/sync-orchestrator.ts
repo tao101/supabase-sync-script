@@ -247,6 +247,17 @@ export class SyncOrchestrator {
         );
       }
 
+      // Verify foreign key integrity - FAIL if orphaned records found
+      const fkValid = await dataSync.verifyForeignKeys();
+      if (!fkValid) {
+        throw new SyncError(
+          'Data verification failed: foreign key violations detected (orphaned records)',
+          ErrorCategory.VALIDATION,
+          'verify',
+          false
+        );
+      }
+
       // Verify sequences - FAIL if invalid
       const sequenceSync = new SequenceSync(this.config, this.targetPool);
       const sequencesValid = await sequenceSync.verifySequences();

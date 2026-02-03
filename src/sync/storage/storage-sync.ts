@@ -75,11 +75,14 @@ export class StorageSync {
 
         if (item.id) {
           // It's a file
+          // Extract size from metadata (Supabase storage returns size in metadata)
+          const size = (item.metadata as { size?: number })?.size ?? 0;
           allFiles.push({
             name: fullPath,
             id: item.id,
             bucket_id: bucketName,
             metadata: item.metadata || {},
+            size,
           });
         } else {
           // It's a folder, recurse
@@ -140,24 +143,46 @@ export class StorageSync {
     let uploaded = 0;
     let failed = 0;
 
-    // Use concurrency limit for parallel uploads
-    const limit = pLimit(this.config.options.storage.concurrency);
+    // Adaptive concurrency configuration
+    const LARGE_FILE_THRESHOLD = 10 * 1024 * 1024; // 10MB in bytes
+    const LARGE_FILE_CONCURRENCY = 2; // Max concurrent large files
+    const configuredConcurrency = this.config.options.storage.concurrency;
 
-    const results = await Promise.allSettled(
-      files.map(file =>
-        limit(async () => {
-          try {
-            await this.syncFile(bucket.name, file.name);
-            uploaded++;
-            logger.debug(`Synced file: ${bucket.name}/${file.name}`);
-          } catch (error) {
-            failed++;
-            logger.warn(`Failed to sync file ${bucket.name}/${file.name}: ${(error as Error).message}`);
-            throw error;
-          }
-        })
-      )
-    );
+    // Separate files into large and small based on threshold
+    const largeFiles = files.filter(f => f.size >= LARGE_FILE_THRESHOLD);
+    const smallFiles = files.filter(f => f.size < LARGE_FILE_THRESHOLD);
+
+    if (largeFiles.length > 0) {
+      logger.info(`Bucket ${bucket.name}: ${largeFiles.length} large files (>=10MB), ${smallFiles.length} small files`);
+    }
+
+    // Create separate limiters for large and small files
+    // Large files use reduced concurrency to limit memory usage
+    const largFileLimit = pLimit(LARGE_FILE_CONCURRENCY);
+    const smallFileLimit = pLimit(configuredConcurrency);
+
+    // Helper to sync a file with the appropriate limiter
+    const syncWithLimit = (file: StorageFile, limiter: ReturnType<typeof pLimit>) => {
+      return limiter(async () => {
+        try {
+          await this.syncFile(bucket.name, file.name);
+          uploaded++;
+          logger.debug(`Synced file: ${bucket.name}/${file.name} (${(file.size / 1024 / 1024).toFixed(2)}MB)`);
+        } catch (error) {
+          failed++;
+          logger.warn(`Failed to sync file ${bucket.name}/${file.name}: ${(error as Error).message}`);
+          throw error;
+        }
+      });
+    };
+
+    // Process small files first with higher concurrency, then large files with reduced concurrency
+    // This approach ensures large files don't block small files and memory stays bounded
+    const smallFilePromises = smallFiles.map(file => syncWithLimit(file, smallFileLimit));
+    const largeFilePromises = largeFiles.map(file => syncWithLimit(file, largFileLimit));
+
+    // Run both sets concurrently but with their respective limits
+    await Promise.allSettled([...smallFilePromises, ...largeFilePromises]);
 
     logger.info(`Bucket ${bucket.name}: ${uploaded} uploaded, ${failed} failed`);
 

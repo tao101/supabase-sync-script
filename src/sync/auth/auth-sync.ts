@@ -4,6 +4,8 @@ import { logger } from '../../utils/logger.js';
 import { AuthUser, AuthIdentity, AuthSyncResult } from '../../types/sync.js';
 import type { PostgresPool } from '../../clients/postgres-client.js';
 
+const BATCH_SIZE = 500;
+
 export class AuthSync {
   constructor(
     private config: Config,
@@ -84,11 +86,48 @@ export class AuthSync {
   }
 
   /**
-   * Import a user via SQL using a provided client connection.
+   * Import a batch of users via SQL using a provided client connection.
+   * Uses multi-row INSERT syntax for better performance.
    * This ensures the operation uses the same connection where
    * session_replication_role = replica has been set.
    */
-  private async importUser(user: AuthUser, client: pg.PoolClient): Promise<void> {
+  private async importUsersBatch(users: AuthUser[], client: pg.PoolClient): Promise<void> {
+    if (users.length === 0) return;
+
+    // Build multi-row VALUES clause
+    const values: unknown[] = [];
+    const valuePlaceholders: string[] = [];
+    const columnsPerRow = 15; // Number of user columns (excluding the 3 fixed ones)
+
+    for (let i = 0; i < users.length; i++) {
+      const user = users[i];
+      const offset = i * columnsPerRow;
+      valuePlaceholders.push(
+        `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, ` +
+        `$${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, ` +
+        `$${offset + 9}, $${offset + 10}, $${offset + 11}, $${offset + 12}, ` +
+        `$${offset + 13}, $${offset + 14}, $${offset + 15}, ` +
+        `'00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated')`
+      );
+      values.push(
+        user.id,
+        user.email,
+        user.phone,
+        user.encrypted_password,
+        user.email_confirmed_at,
+        user.phone_confirmed_at,
+        JSON.stringify(user.raw_user_meta_data),
+        JSON.stringify(user.raw_app_meta_data),
+        user.created_at,
+        user.updated_at,
+        user.banned_until,
+        user.confirmation_token,
+        user.recovery_token,
+        user.email_change_token_new,
+        user.email_change
+      );
+    }
+
     await client.query(`
       INSERT INTO auth.users (
         id, email, phone, encrypted_password,
@@ -98,15 +137,7 @@ export class AuthSync {
         confirmation_token, recovery_token,
         email_change_token_new, email_change,
         instance_id, aud, role
-      ) VALUES (
-        $1, $2, $3, $4,
-        $5, $6,
-        $7, $8,
-        $9, $10, $11,
-        $12, $13,
-        $14, $15,
-        '00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated'
-      )
+      ) VALUES ${valuePlaceholders.join(', ')}
       ON CONFLICT (id) DO UPDATE SET
         email = EXCLUDED.email,
         phone = EXCLUDED.phone,
@@ -117,52 +148,52 @@ export class AuthSync {
         raw_app_meta_data = EXCLUDED.raw_app_meta_data,
         updated_at = EXCLUDED.updated_at,
         banned_until = EXCLUDED.banned_until
-    `, [
-      user.id,
-      user.email,
-      user.phone,
-      user.encrypted_password,
-      user.email_confirmed_at,
-      user.phone_confirmed_at,
-      JSON.stringify(user.raw_user_meta_data),
-      JSON.stringify(user.raw_app_meta_data),
-      user.created_at,
-      user.updated_at,
-      user.banned_until,
-      user.confirmation_token,
-      user.recovery_token,
-      user.email_change_token_new,
-      user.email_change,
-    ]);
+    `, values);
   }
 
   /**
-   * Import an identity using a provided client connection.
+   * Import a batch of identities using a provided client connection.
+   * Uses multi-row INSERT syntax for better performance.
    * This ensures the operation uses the same connection where
    * session_replication_role = replica has been set.
    */
-  private async importIdentity(identity: AuthIdentity, client: pg.PoolClient): Promise<void> {
+  private async importIdentitiesBatch(identities: AuthIdentity[], client: pg.PoolClient): Promise<void> {
+    if (identities.length === 0) return;
+
+    // Build multi-row VALUES clause
+    const values: unknown[] = [];
+    const valuePlaceholders: string[] = [];
+    const columnsPerRow = 8;
+
+    for (let i = 0; i < identities.length; i++) {
+      const identity = identities[i];
+      const offset = i * columnsPerRow;
+      valuePlaceholders.push(
+        `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, ` +
+        `$${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8})`
+      );
+      values.push(
+        identity.id,
+        identity.user_id,
+        JSON.stringify(identity.identity_data),
+        identity.provider,
+        identity.provider_id,
+        identity.last_sign_in_at,
+        identity.created_at,
+        identity.updated_at
+      );
+    }
+
     await client.query(`
       INSERT INTO auth.identities (
         id, user_id, identity_data, provider, provider_id,
         last_sign_in_at, created_at, updated_at
-      ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8
-      )
+      ) VALUES ${valuePlaceholders.join(', ')}
       ON CONFLICT (id) DO UPDATE SET
         identity_data = EXCLUDED.identity_data,
         last_sign_in_at = EXCLUDED.last_sign_in_at,
         updated_at = EXCLUDED.updated_at
-    `, [
-      identity.id,
-      identity.user_id,
-      JSON.stringify(identity.identity_data),
-      identity.provider,
-      identity.provider_id,
-      identity.last_sign_in_at,
-      identity.created_at,
-      identity.updated_at,
-    ]);
+    `, values);
   }
 
   async sync(): Promise<AuthSyncResult> {
@@ -200,27 +231,35 @@ export class AuthSync {
       // Clear target using the same connection
       await this.clearTargetAuth(client);
 
-      // Import users using the same connection
-      for (const user of users) {
+      // Import users in batches using the same connection
+      logger.info(`Importing ${users.length} users in batches of ${BATCH_SIZE}...`);
+      for (let i = 0; i < users.length; i += BATCH_SIZE) {
+        const batch = users.slice(i, i + BATCH_SIZE);
         try {
-          await this.importUser(user, client);
-          usersImported++;
+          await this.importUsersBatch(batch, client);
+          usersImported += batch.length;
+          logger.debug(`Imported users batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(users.length / BATCH_SIZE)} (${batch.length} users)`);
         } catch (error) {
-          const msg = `Failed to import user ${user.email || user.id}: ${(error as Error).message}`;
+          const msg = `Failed to import user batch ${Math.floor(i / BATCH_SIZE) + 1}: ${(error as Error).message}`;
           logger.warn(msg);
           errors.push(msg);
         }
       }
 
-      // Import identities using the same connection
-      for (const identity of identities) {
-        try {
-          await this.importIdentity(identity, client);
-          identitiesImported++;
-        } catch (error) {
-          const msg = `Failed to import identity ${identity.id}: ${(error as Error).message}`;
-          logger.warn(msg);
-          errors.push(msg);
+      // Import identities in batches using the same connection
+      if (identities.length > 0) {
+        logger.info(`Importing ${identities.length} identities in batches of ${BATCH_SIZE}...`);
+        for (let i = 0; i < identities.length; i += BATCH_SIZE) {
+          const batch = identities.slice(i, i + BATCH_SIZE);
+          try {
+            await this.importIdentitiesBatch(batch, client);
+            identitiesImported += batch.length;
+            logger.debug(`Imported identities batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(identities.length / BATCH_SIZE)} (${batch.length} identities)`);
+          } catch (error) {
+            const msg = `Failed to import identity batch ${Math.floor(i / BATCH_SIZE) + 1}: ${(error as Error).message}`;
+            logger.warn(msg);
+            errors.push(msg);
+          }
         }
       }
 
