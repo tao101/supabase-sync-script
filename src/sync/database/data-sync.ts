@@ -109,7 +109,12 @@ export class DataSync {
         SELECT schemaname, tablename
         FROM pg_tables
         WHERE schemaname = ANY($1)
-        AND tablename NOT IN ('schema_migrations', 'migrations')
+        AND tablename NOT IN (
+          'schema_migrations',
+          'migrations',
+          'buckets_vectors',
+          'vector_indexes'
+        )
         ORDER BY schemaname, tablename
       `, [this.config.options.database.includeSchemas]);
 
@@ -191,7 +196,12 @@ export class DataSync {
         SELECT schemaname, tablename
         FROM pg_tables
         WHERE schemaname = ANY($1)
-        AND tablename NOT IN ('schema_migrations', 'migrations')
+        AND tablename NOT IN (
+          'schema_migrations',
+          'migrations',
+          'buckets_vectors',
+          'vector_indexes'
+        )
         ORDER BY schemaname, tablename
       `, [this.config.options.database.includeSchemas]);
 
