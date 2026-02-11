@@ -16,6 +16,7 @@ export class SyncOrchestrator {
   private targetSupabase: SupabaseClient | null = null;
   private tempFileManager: TempFileManager;
   private stepResults: StepResult[] = [];
+  private warnings: string[] = [];
   private startTime: number = 0;
 
   constructor(private config: Config) {
@@ -25,6 +26,7 @@ export class SyncOrchestrator {
   async execute(): Promise<SyncResult> {
     this.startTime = Date.now();
     this.stepResults = [];
+    this.warnings = [];
 
     try {
       // Initialize temp files
@@ -189,13 +191,24 @@ export class SyncOrchestrator {
 
   private async syncSchema(): Promise<void> {
     const schemaSync = new SchemaSync(this.config, this.tempFileManager);
-    await schemaSync.sync();
+    const schemaWarnings = await schemaSync.sync();
+    if (schemaWarnings.length > 0) {
+      this.warnings.push(...schemaWarnings.map(w => `[schema] ${w}`));
+    }
   }
 
   private async syncData(): Promise<void> {
     if (!this.sourcePool || !this.targetPool) throw new Error('Pools not initialized');
     const dataSync = new DataSync(this.config, this.tempFileManager, this.targetPool);
-    await dataSync.sync(this.sourcePool);
+    const { importWarnings, mismatches } = await dataSync.sync(this.sourcePool);
+    if (importWarnings.length > 0) {
+      this.warnings.push(...importWarnings.map(w => `[data-import] ${w}`));
+    }
+    if (mismatches.length > 0) {
+      this.warnings.push(...mismatches.map(m =>
+        `[data-verify] Row count mismatch: ${m.table} source=${m.source} target=${m.target}`
+      ));
+    }
   }
 
   private async resetSequences(): Promise<void> {
@@ -226,7 +239,27 @@ export class SyncOrchestrator {
       this.targetSupabase,
       this.targetPool || undefined
     );
-    await storageSync.sync();
+    const result = await storageSync.sync();
+
+    // Surface storage failures as warnings
+    for (const bucket of result.buckets) {
+      if (bucket.failed > 0 && bucket.total === 0) {
+        // Bucket-level failure (creation or listing failed entirely)
+        this.warnings.push(
+          `[storage] Bucket "${bucket.bucket}": failed to sync (bucket creation or file listing error)`
+        );
+      } else if (bucket.failed > 0) {
+        // File-level failures
+        this.warnings.push(
+          `[storage] Bucket "${bucket.bucket}": ${bucket.failed}/${bucket.total} files failed to sync`
+        );
+      }
+      if (bucket.total === 0 && bucket.failed === 0) {
+        this.warnings.push(
+          `[storage] Bucket "${bucket.bucket}": 0 files found (bucket may be empty or Storage API may be misconfigured)`
+        );
+      }
+    }
   }
 
   private async verify(): Promise<void> {
@@ -265,6 +298,7 @@ export class SyncOrchestrator {
 
     return {
       success,
+      partialSuccess: success && this.warnings.length > 0,
       steps: this.stepResults,
       duration,
       errors: error
@@ -278,6 +312,7 @@ export class SyncOrchestrator {
             ),
           ]
         : [],
+      warnings: this.warnings.length > 0 ? this.warnings : undefined,
     };
   }
 }

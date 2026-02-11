@@ -57,10 +57,11 @@ export class SchemaSync {
     }
   }
 
-  async importSchema(dumpFile: string): Promise<void> {
+  async importSchema(dumpFile: string): Promise<string[]> {
     logger.info('Importing database schema to target...');
 
     const targetDbUrl = this.connectionBuilder.buildDbUrl(this.config.target);
+    const warnings: string[] = [];
 
     // Pre-process the dump file to remove problematic statements
     const processedFile = await this.preprocessDumpFile(dumpFile);
@@ -69,7 +70,6 @@ export class SchemaSync {
       const result = await execa('psql', [
         targetDbUrl,
         '-f', processedFile,
-        '--single-transaction',
         '-v', 'ON_ERROR_STOP=0', // Continue on errors (some objects may already exist)
       ], {
         env: { ...process.env, PGPASSWORD: this.config.target.dbPassword },
@@ -93,6 +93,7 @@ export class SchemaSync {
           if (errorLines.length > 5) {
             logger.warn(`  ... and ${errorLines.length - 5} more errors`);
           }
+          warnings.push(...errorLines.map(line => line.trim()));
         }
       }
 
@@ -104,7 +105,10 @@ export class SchemaSync {
     } catch (error) {
       // Log but don't fail - some errors are expected (existing objects)
       logger.warn(`Schema import completed with warnings: ${(error as Error).message}`);
+      warnings.push((error as Error).message);
     }
+
+    return warnings;
   }
 
   private async preprocessDumpFile(dumpFile: string): Promise<string> {
@@ -131,13 +135,13 @@ export class SchemaSync {
     return processedFile;
   }
 
-  async sync(): Promise<void> {
+  async sync(): Promise<string[]> {
     if (this.config.dryRun) {
       logger.info('[DRY RUN] Would export and import database schema');
-      return;
+      return [];
     }
 
     const dumpFile = await this.exportSchema();
-    await this.importSchema(dumpFile);
+    return await this.importSchema(dumpFile);
   }
 }
