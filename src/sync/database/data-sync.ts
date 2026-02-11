@@ -6,6 +6,38 @@ import { logger } from '../../utils/logger.js';
 import { SyncError, ErrorCategory } from '../../types/sync.js';
 import type { PostgresPool } from '../../clients/postgres-client.js';
 
+// Supabase internal auth tables that are version-dependent and should not be
+// synced via pg_dump. Auth users and identities are handled by AuthSync.
+const EXCLUDED_AUTH_SYSTEM_TABLES = [
+  'auth.sessions',
+  'auth.refresh_tokens',
+  'auth.mfa_factors',
+  'auth.mfa_challenges',
+  'auth.mfa_amr_claims',
+  'auth.saml_relay_states',
+  'auth.saml_providers',
+  'auth.sso_providers',
+  'auth.sso_domains',
+  'auth.flow_state',
+  'auth.one_time_tokens',
+  'auth.oauth_clients',
+  'auth.oauth_authorizations',
+  'auth.oauth_client_states',
+];
+
+// Storage tables managed by StorageSync via the Supabase Storage API
+const EXCLUDED_STORAGE_SYSTEM_TABLES = [
+  'storage.buckets',
+  'storage.objects',
+  'storage.s3_multipart_uploads',
+  'storage.s3_multipart_uploads_parts',
+];
+
+const ALL_EXCLUDED_SYSTEM_TABLES = [
+  ...EXCLUDED_AUTH_SYSTEM_TABLES,
+  ...EXCLUDED_STORAGE_SYSTEM_TABLES,
+];
+
 export class DataSync {
   private connectionBuilder: ConnectionBuilder;
 
@@ -43,9 +75,10 @@ export class DataSync {
       args.push(`--exclude-table=${table}`);
     }
 
-    // Always exclude session-related tables
-    args.push('--exclude-table=auth.sessions');
-    args.push('--exclude-table=auth.refresh_tokens');
+    // Exclude Supabase system tables (auth internals + storage tables managed by API)
+    for (const table of ALL_EXCLUDED_SYSTEM_TABLES) {
+      args.push(`--exclude-table=${table}`);
+    }
 
     try {
       await execa('pg_dump', args, {
@@ -122,6 +155,14 @@ export class DataSync {
       await client.query('SET session_replication_role = replica;');
 
       for (const row of tablesResult.rows) {
+        const tableName = `${row.schemaname}.${row.tablename}`;
+
+        // Skip system tables managed separately (auth internals, storage via API)
+        if (ALL_EXCLUDED_SYSTEM_TABLES.includes(tableName)) {
+          logger.debug(`Skipping truncation of ${tableName} (managed separately)`);
+          continue;
+        }
+
         try {
           await client.query(`TRUNCATE TABLE "${row.schemaname}"."${row.tablename}" CASCADE`);
           logger.debug(`Truncated ${row.schemaname}.${row.tablename}`);
@@ -136,10 +177,11 @@ export class DataSync {
     }
   }
 
-  async importData(dumpFile: string): Promise<void> {
+  async importData(dumpFile: string): Promise<string[]> {
     logger.info('Importing database data to target...');
 
     const targetDbUrl = this.connectionBuilder.buildDbUrl(this.config.target);
+    const warnings: string[] = [];
 
     try {
       // Use -c to set session_replication_role before importing
@@ -167,6 +209,7 @@ export class DataSync {
           if (errorLines.length > 10) {
             logger.warn(`  ... and ${errorLines.length - 10} more errors`);
           }
+          warnings.push(...errorLines.map(line => line.trim()));
         }
       }
 
@@ -181,10 +224,13 @@ export class DataSync {
       }
     } catch (error) {
       logger.warn(`Data import completed with warnings: ${(error as Error).message}`);
+      warnings.push((error as Error).message);
     }
+
+    return warnings;
   }
 
-  async verifyDataCounts(sourcePool: PostgresPool): Promise<void> {
+  async verifyDataCounts(sourcePool: PostgresPool): Promise<{ table: string; source: number; target: number }[]> {
     logger.info('Verifying data counts between source and target...');
 
     const sourceClient = await sourcePool.connect();
@@ -207,15 +253,12 @@ export class DataSync {
 
       const mismatches: { table: string; source: number; target: number }[] = [];
 
-      // Tables that are intentionally excluded from sync (always empty on target)
-      const alwaysExcludedTables = ['auth.sessions', 'auth.refresh_tokens'];
-
       for (const row of tablesResult.rows) {
         const tableName = `${row.schemaname}.${row.tablename}`;
 
-        // Skip excluded tables and always-excluded tables
+        // Skip excluded tables and system tables managed separately
         if (this.config.options.database.excludeTables.includes(tableName) ||
-            alwaysExcludedTables.includes(tableName)) {
+            ALL_EXCLUDED_SYSTEM_TABLES.includes(tableName)) {
           continue;
         }
 
@@ -253,33 +296,39 @@ export class DataSync {
       } else {
         logger.info('All table row counts match between source and target');
       }
+
+      return mismatches;
     } finally {
       sourceClient.release();
       targetClient.release();
     }
   }
 
-  async sync(sourcePool?: PostgresPool): Promise<void> {
+  async sync(sourcePool?: PostgresPool): Promise<{ importWarnings: string[]; mismatches: { table: string; source: number; target: number }[] }> {
     if (this.config.dryRun) {
       logger.info('[DRY RUN] Would export and import database data');
-      return;
+      return { importWarnings: [], mismatches: [] };
     }
 
     // Export data from source
     const dumpFile = await this.exportData();
 
     // Disable constraints, clear data, import, re-enable constraints
+    let importWarnings: string[] = [];
     await this.disableConstraints();
     try {
       await this.clearTargetData();
-      await this.importData(dumpFile);
+      importWarnings = await this.importData(dumpFile);
     } finally {
       await this.enableConstraints();
     }
 
     // Verify data counts if source pool is provided
+    let mismatches: { table: string; source: number; target: number }[] = [];
     if (sourcePool) {
-      await this.verifyDataCounts(sourcePool);
+      mismatches = await this.verifyDataCounts(sourcePool);
     }
+
+    return { importWarnings, mismatches };
   }
 }

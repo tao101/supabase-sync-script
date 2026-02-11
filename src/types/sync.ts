@@ -6,9 +6,11 @@ export interface SyncStep {
 
 export interface SyncResult {
   success: boolean;
+  partialSuccess?: boolean;
   steps: StepResult[];
   duration: number;
   errors: SyncError[];
+  warnings?: string[];
 }
 
 export interface StepResult {
@@ -17,6 +19,7 @@ export interface StepResult {
   duration: number;
   error?: Error;
   details?: Record<string, unknown>;
+  warnings?: string[];
 }
 
 export enum ErrorCategory {

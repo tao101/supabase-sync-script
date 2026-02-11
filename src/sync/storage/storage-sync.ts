@@ -59,14 +59,19 @@ export class StorageSync {
     let offset = 0;
     const limit = 1000;
 
+    logger.debug(`Listing files in bucket "${bucketName}" with prefix "${prefix || '(root)'}"`);
+
     while (true) {
       const { data, error } = await this.sourceSupabase.storage
         .from(bucketName)
-        .list(prefix, { limit, offset });
+        .list(prefix || undefined, { limit, offset });
 
       if (error) {
+        logger.error(`Storage list error for ${bucketName}/${prefix}: ${JSON.stringify(error)}`);
         throw new Error(`Failed to list files in ${bucketName}/${prefix}: ${error.message}`);
       }
+
+      logger.debug(`  ${bucketName}/${prefix || '(root)'}: got ${data?.length ?? 0} items (offset=${offset})`);
 
       if (!data || data.length === 0) break;
 
@@ -83,6 +88,7 @@ export class StorageSync {
           });
         } else {
           // It's a folder, recurse
+          logger.debug(`    Recursing into folder: ${fullPath}`);
           const subFiles = await this.listAllFiles(bucketName, fullPath);
           allFiles.push(...subFiles);
         }
@@ -136,6 +142,15 @@ export class StorageSync {
     // List all files
     const files = await this.listAllFiles(bucket.name);
     logger.info(`Found ${files.length} files in bucket ${bucket.name}`);
+
+    if (files.length === 0) {
+      logger.warn(
+        `Bucket "${bucket.name}" returned 0 files from the Storage API. ` +
+        `This may indicate: (1) the bucket is truly empty, (2) the Storage API URL is incorrect ` +
+        `for self-hosted instances, or (3) the service role key lacks storage permissions. ` +
+        `Check that the source API URL is correct and that the key has storage.objects read access.`
+      );
+    }
 
     let uploaded = 0;
     let failed = 0;

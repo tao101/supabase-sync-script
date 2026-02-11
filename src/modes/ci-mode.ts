@@ -71,22 +71,38 @@ export function printCIValidationResult(isValid: boolean, errors: string[]): voi
 
 export function printCISummary(results: {
   success: boolean;
+  partialSuccess?: boolean;
   duration: number;
   steps: { name: string; success: boolean; duration: number }[];
+  warnings?: string[];
 }): void {
   console.log('\n');
   console.log('='.repeat(60));
   console.log('SYNC SUMMARY');
   console.log('='.repeat(60));
-  console.log(`Status: ${results.success ? 'SUCCESS' : 'FAILED'}`);
+
+  let status = results.success ? 'SUCCESS' : 'FAILED';
+  if (results.partialSuccess) status = 'PARTIAL_SUCCESS';
+  console.log(`Status: ${status}`);
   console.log(`Duration: ${(results.duration / 1000).toFixed(2)}s`);
   console.log('-'.repeat(60));
   console.log('Steps:');
 
   for (const step of results.steps) {
-    const status = step.success ? '✓' : '✗';
+    const stepStatus = step.success ? '✓' : '✗';
     const duration = (step.duration / 1000).toFixed(2);
-    console.log(`  ${status} ${step.name} (${duration}s)`);
+    console.log(`  ${stepStatus} ${step.name} (${duration}s)`);
+  }
+
+  if (results.warnings && results.warnings.length > 0) {
+    console.log('-'.repeat(60));
+    console.log(`Warnings (${results.warnings.length}):`);
+    for (const w of results.warnings.slice(0, 20)) {
+      console.log(`  ! ${w}`);
+    }
+    if (results.warnings.length > 20) {
+      console.log(`  ... and ${results.warnings.length - 20} more`);
+    }
   }
 
   console.log('='.repeat(60));
