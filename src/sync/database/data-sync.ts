@@ -285,26 +285,37 @@ export class DataSync {
     const client = await this.targetPool.connect();
 
     try {
-      // Query all foreign key constraints in the included schemas
+      // Query all foreign key constraints using pg_catalog tables
+      // which correctly handle composite foreign keys via conkey/confkey arrays
       const fkResult = await client.query(`
         SELECT
-          tc.constraint_name,
-          tc.table_schema AS child_schema,
-          tc.table_name AS child_table,
-          kcu.column_name AS child_column,
-          ccu.table_schema AS parent_schema,
-          ccu.table_name AS parent_table,
-          ccu.column_name AS parent_column
-        FROM information_schema.table_constraints tc
-        JOIN information_schema.key_column_usage kcu
-          ON tc.constraint_name = kcu.constraint_name
-          AND tc.table_schema = kcu.table_schema
-        JOIN information_schema.constraint_column_usage ccu
-          ON ccu.constraint_name = tc.constraint_name
-          AND ccu.table_schema = tc.table_schema
-        WHERE tc.constraint_type = 'FOREIGN KEY'
-          AND tc.table_schema = ANY($1)
-        ORDER BY tc.table_schema, tc.table_name, tc.constraint_name
+          c.conname AS constraint_name,
+          child_ns.nspname AS child_schema,
+          child_rel.relname AS child_table,
+          ARRAY(
+            SELECT a.attname
+            FROM pg_attribute a
+            WHERE a.attrelid = c.conrelid
+              AND a.attnum = ANY(c.conkey)
+            ORDER BY array_position(c.conkey, a.attnum)
+          ) AS child_columns,
+          parent_ns.nspname AS parent_schema,
+          parent_rel.relname AS parent_table,
+          ARRAY(
+            SELECT a.attname
+            FROM pg_attribute a
+            WHERE a.attrelid = c.confrelid
+              AND a.attnum = ANY(c.confkey)
+            ORDER BY array_position(c.confkey, a.attnum)
+          ) AS parent_columns
+        FROM pg_constraint c
+        JOIN pg_class child_rel ON c.conrelid = child_rel.oid
+        JOIN pg_namespace child_ns ON child_rel.relnamespace = child_ns.oid
+        JOIN pg_class parent_rel ON c.confrelid = parent_rel.oid
+        JOIN pg_namespace parent_ns ON parent_rel.relnamespace = parent_ns.oid
+        WHERE c.contype = 'f'
+          AND child_ns.nspname = ANY($1)
+        ORDER BY child_ns.nspname, child_rel.relname, c.conname
       `, [this.config.options.database.includeSchemas]);
 
       const violations: {
@@ -317,18 +328,27 @@ export class DataSync {
       for (const fk of fkResult.rows) {
         const childTable = `"${fk.child_schema}"."${fk.child_table}"`;
         const parentTable = `"${fk.parent_schema}"."${fk.parent_table}"`;
-        const childColumn = `"${fk.child_column}"`;
-        const parentColumn = `"${fk.parent_column}"`;
+        const childColumns: string[] = fk.child_columns;
+        const parentColumns: string[] = fk.parent_columns;
 
         try {
+          // Build composite column references for the orphan check
+          const nullChecks = childColumns
+            .map(col => `c."${col}" IS NOT NULL`)
+            .join(' AND ');
+
+          const joinConditions = childColumns
+            .map((col, i) => `p."${parentColumns[i]}" = c."${col}"`)
+            .join(' AND ');
+
           // Check for orphaned records: child records pointing to non-existent parent records
           const orphanResult = await client.query(`
             SELECT COUNT(*) as orphan_count
             FROM ${childTable} c
-            WHERE c.${childColumn} IS NOT NULL
+            WHERE ${nullChecks}
               AND NOT EXISTS (
                 SELECT 1 FROM ${parentTable} p
-                WHERE p.${parentColumn} = c.${childColumn}
+                WHERE ${joinConditions}
               )
           `);
 
@@ -369,7 +389,7 @@ export class DataSync {
     }
   }
 
-  async sync(sourcePool?: PostgresPool): Promise<void> {
+  async sync(sourcePool: PostgresPool): Promise<void> {
     if (this.config.dryRun) {
       logger.info('[DRY RUN] Would export and import database data');
       return;
@@ -383,5 +403,16 @@ export class DataSync {
     // within that transaction, which correctly disables triggers during the import
     await this.clearTargetData();
     await this.importData(dumpFile);
+
+    // Verify data counts match between source and target
+    const countsMatch = await this.verifyDataCounts(sourcePool);
+    if (!countsMatch) {
+      throw new SyncError(
+        'Data sync verification failed: row counts do not match between source and target',
+        ErrorCategory.VALIDATION,
+        'data-sync',
+        false
+      );
+    }
   }
 }
