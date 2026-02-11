@@ -239,7 +239,21 @@ export class SyncOrchestrator {
       this.targetSupabase,
       this.targetPool || undefined
     );
-    await storageSync.sync();
+    const result = await storageSync.sync();
+
+    // Surface storage failures as warnings
+    for (const bucket of result.buckets) {
+      if (bucket.failed > 0) {
+        this.warnings.push(
+          `[storage] Bucket "${bucket.bucket}": ${bucket.failed}/${bucket.total} files failed to sync`
+        );
+      }
+      if (bucket.total === 0) {
+        this.warnings.push(
+          `[storage] Bucket "${bucket.bucket}": 0 files found (bucket may be empty or Storage API may be misconfigured)`
+        );
+      }
+    }
   }
 
   private async verify(): Promise<void> {

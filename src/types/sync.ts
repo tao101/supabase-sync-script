@@ -19,7 +19,6 @@ export interface StepResult {
   duration: number;
   error?: Error;
   details?: Record<string, unknown>;
-  warnings?: string[];
 }
 
 export enum ErrorCategory {
