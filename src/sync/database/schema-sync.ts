@@ -93,6 +93,12 @@ export class SchemaSync {
           if (errorLines.length > 5) {
             logger.warn(`  ... and ${errorLines.length - 5} more errors`);
           }
+          throw new SyncError(
+            `Schema import failed with ${errorLines.length} error(s): ${errorLines[0]?.trim() || 'unknown error'}`,
+            ErrorCategory.IMPORT,
+            'schema-import',
+            false
+          );
         }
       }
 
@@ -102,8 +108,16 @@ export class SchemaSync {
         logger.info('Schema imported successfully');
       }
     } catch (error) {
-      // Log but don't fail - some errors are expected (existing objects)
-      logger.warn(`Schema import completed with warnings: ${(error as Error).message}`);
+      if (error instanceof SyncError) {
+        throw error;
+      }
+      throw new SyncError(
+        `Schema import failed: ${(error as Error).message}`,
+        ErrorCategory.IMPORT,
+        'schema-import',
+        false,
+        error as Error
+      );
     }
   }
 

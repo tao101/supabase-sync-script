@@ -383,10 +383,5 @@ export class DataSync {
     // within that transaction, which correctly disables triggers during the import
     await this.clearTargetData();
     await this.importData(dumpFile);
-
-    // Verify data counts if source pool is provided
-    if (sourcePool) {
-      await this.verifyDataCounts(sourcePool);
-    }
   }
 }

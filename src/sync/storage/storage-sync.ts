@@ -3,7 +3,7 @@ import pLimit from 'p-limit';
 import type { Config } from '../../types/config.js';
 import type { PostgresPool } from '../../clients/postgres-client.js';
 import { logger } from '../../utils/logger.js';
-import { StorageSyncResult, BucketSyncResult, StorageBucket, StorageFile } from '../../types/sync.js';
+import { StorageSyncResult, BucketSyncResult, StorageBucket, StorageFile, SyncError, ErrorCategory } from '../../types/sync.js';
 import { withRetry } from '../../utils/retry.js';
 
 export class StorageSync {
@@ -236,6 +236,15 @@ export class StorageSync {
     const totalFailed = results.reduce((sum, r) => sum + r.failed, 0);
 
     logger.info(`Storage sync complete: ${results.length} buckets, ${totalUploaded}/${totalFiles} files, ${totalFailed} failed`);
+
+    if (totalFailed > 0) {
+      throw new SyncError(
+        `Storage sync failed: ${totalFailed}/${totalFiles} files failed to upload`,
+        ErrorCategory.STORAGE,
+        'storage-sync',
+        false
+      );
+    }
 
     // Rewrite storage URLs in database to point to target
     if (this.targetPool) {
