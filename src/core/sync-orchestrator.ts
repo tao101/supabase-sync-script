@@ -16,6 +16,7 @@ export class SyncOrchestrator {
   private targetSupabase: SupabaseClient | null = null;
   private tempFileManager: TempFileManager;
   private stepResults: StepResult[] = [];
+  private warnings: string[] = [];
   private startTime: number = 0;
 
   constructor(private config: Config) {
@@ -25,6 +26,7 @@ export class SyncOrchestrator {
   async execute(): Promise<SyncResult> {
     this.startTime = Date.now();
     this.stepResults = [];
+    this.warnings = [];
 
     try {
       // Initialize temp files
@@ -226,7 +228,27 @@ export class SyncOrchestrator {
       this.targetSupabase,
       this.targetPool || undefined
     );
-    await storageSync.sync();
+    const result = await storageSync.sync();
+
+    // Surface storage failures as warnings
+    for (const bucket of result.buckets) {
+      if (bucket.failed > 0 && bucket.total === 0) {
+        // Bucket-level failure (creation or listing failed entirely)
+        this.warnings.push(
+          `[storage] Bucket "${bucket.bucket}": failed to sync (bucket creation or file listing error)`
+        );
+      } else if (bucket.failed > 0) {
+        // File-level failures
+        this.warnings.push(
+          `[storage] Bucket "${bucket.bucket}": ${bucket.failed}/${bucket.total} files failed to sync`
+        );
+      }
+      if (bucket.total === 0 && bucket.failed === 0) {
+        this.warnings.push(
+          `[storage] Bucket "${bucket.bucket}": 0 files found (bucket may be empty or Storage API may be misconfigured)`
+        );
+      }
+    }
   }
 
   private async verify(): Promise<void> {
@@ -287,6 +309,7 @@ export class SyncOrchestrator {
 
     return {
       success,
+      partialSuccess: success && this.warnings.length > 0,
       steps: this.stepResults,
       duration,
       errors: error
@@ -300,6 +323,7 @@ export class SyncOrchestrator {
             ),
           ]
         : [],
+      warnings: this.warnings.length > 0 ? this.warnings : undefined,
     };
   }
 }

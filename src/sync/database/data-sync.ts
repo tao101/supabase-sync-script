@@ -18,6 +18,38 @@ const EXCLUDED_SYSTEM_TABLES = [
   'vector_indexes',
 ] as const;
 
+// Supabase internal auth tables that are version-dependent and should not be
+// synced via pg_dump. Auth users and identities are handled by AuthSync.
+const EXCLUDED_AUTH_SYSTEM_TABLES = [
+  'auth.sessions',
+  'auth.refresh_tokens',
+  'auth.mfa_factors',
+  'auth.mfa_challenges',
+  'auth.mfa_amr_claims',
+  'auth.saml_relay_states',
+  'auth.saml_providers',
+  'auth.sso_providers',
+  'auth.sso_domains',
+  'auth.flow_state',
+  'auth.one_time_tokens',
+  'auth.oauth_clients',
+  'auth.oauth_authorizations',
+  'auth.oauth_client_states',
+];
+
+// Storage tables managed by StorageSync via the Supabase Storage API
+const EXCLUDED_STORAGE_SYSTEM_TABLES = [
+  'storage.buckets',
+  'storage.objects',
+  'storage.s3_multipart_uploads',
+  'storage.s3_multipart_uploads_parts',
+];
+
+const ALL_EXCLUDED_SYSTEM_TABLES = [
+  ...EXCLUDED_AUTH_SYSTEM_TABLES,
+  ...EXCLUDED_STORAGE_SYSTEM_TABLES,
+];
+
 export class DataSync {
   private connectionBuilder: ConnectionBuilder;
 
@@ -54,9 +86,10 @@ export class DataSync {
       args.push(`--exclude-table=${table}`);
     }
 
-    // Always exclude session-related tables
-    args.push('--exclude-table=auth.sessions');
-    args.push('--exclude-table=auth.refresh_tokens');
+    // Exclude Supabase system tables (auth internals + storage tables managed by API)
+    for (const table of ALL_EXCLUDED_SYSTEM_TABLES) {
+      args.push(`--exclude-table=${table}`);
+    }
 
     try {
       await execa('pg_dump', args, {
@@ -94,11 +127,18 @@ export class DataSync {
       await client.query('SET session_replication_role = replica;');
 
       for (const row of tablesResult.rows) {
+        const tableName = `${row.schemaname}.${row.tablename}`;
+
+        // Skip system tables managed separately (auth internals, storage via API)
+        if (ALL_EXCLUDED_SYSTEM_TABLES.includes(tableName)) {
+          logger.debug(`Skipping truncation of ${tableName} (managed separately)`);
+          continue;
+        }
+
         try {
           await client.query(`TRUNCATE TABLE "${row.schemaname}"."${row.tablename}" CASCADE`);
           logger.debug(`Truncated ${row.schemaname}.${row.tablename}`);
         } catch (error) {
-          const tableName = `${row.schemaname}.${row.tablename}`;
           throw new SyncError(
             `Failed to truncate table ${tableName}: ${(error as Error).message}`,
             ErrorCategory.IMPORT,
@@ -206,14 +246,11 @@ export class DataSync {
         ORDER BY schemaname, tablename
       `, [this.config.options.database.includeSchemas, ...EXCLUDED_SYSTEM_TABLES]);
 
-      // Tables that are intentionally excluded from sync (always empty on target)
-      const alwaysExcludedTables = ['auth.sessions', 'auth.refresh_tokens'];
-
       // Filter tables to verify
       const tablesToVerify = tablesResult.rows.filter(row => {
         const tableName = `${row.schemaname}.${row.tablename}`;
         return !this.config.options.database.excludeTables.includes(tableName) &&
-               !alwaysExcludedTables.includes(tableName);
+               !ALL_EXCLUDED_SYSTEM_TABLES.includes(tableName);
       });
 
       // Use p-limit to run COUNT queries in parallel with concurrency limit of 5

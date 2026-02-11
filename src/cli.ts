@@ -116,13 +116,32 @@ program
         printCISummary(result);
       } else {
         print.header('Sync Summary');
-        console.log(chalk.bold(`Status: ${result.success ? chalk.green('SUCCESS') : chalk.red('FAILED')}`));
+
+        let statusText: string;
+        if (result.success && !result.partialSuccess) {
+          statusText = chalk.green('SUCCESS');
+        } else if (result.partialSuccess) {
+          statusText = chalk.yellow('PARTIAL SUCCESS');
+        } else {
+          statusText = chalk.red('FAILED');
+        }
+        console.log(chalk.bold(`Status: ${statusText}`));
         console.log(chalk.gray(`Duration: ${(result.duration / 1000).toFixed(2)}s`));
         console.log('\nSteps:');
         for (const step of result.steps) {
           const icon = step.success ? chalk.green('✓') : chalk.red('✗');
           const duration = chalk.gray(`(${(step.duration / 1000).toFixed(2)}s)`);
           console.log(`  ${icon} ${step.name} ${duration}`);
+        }
+
+        if (result.warnings && result.warnings.length > 0) {
+          console.log(chalk.yellow(`\nWarnings (${result.warnings.length}):`));
+          for (const w of result.warnings.slice(0, 20)) {
+            console.log(chalk.yellow(`  ! ${w}`));
+          }
+          if (result.warnings.length > 20) {
+            console.log(chalk.yellow(`  ... and ${result.warnings.length - 20} more`));
+          }
         }
       }
 

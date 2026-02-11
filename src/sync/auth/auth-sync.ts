@@ -240,9 +240,19 @@ export class AuthSync {
           usersImported += batch.length;
           logger.debug(`Imported users batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(users.length / BATCH_SIZE)} (${batch.length} users)`);
         } catch (error) {
-          const msg = `Failed to import user batch ${Math.floor(i / BATCH_SIZE) + 1}: ${(error as Error).message}`;
-          logger.warn(msg);
-          errors.push(msg);
+          // Batch failed — retry records individually to save valid ones
+          const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+          logger.warn(`User batch ${batchNum} failed, retrying ${batch.length} users individually...`);
+          for (const user of batch) {
+            try {
+              await this.importUsersBatch([user], client);
+              usersImported++;
+            } catch (individualError) {
+              const msg = `Failed to import user ${user.id}: ${(individualError as Error).message}`;
+              logger.warn(msg);
+              errors.push(msg);
+            }
+          }
         }
       }
 
@@ -256,9 +266,19 @@ export class AuthSync {
             identitiesImported += batch.length;
             logger.debug(`Imported identities batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(identities.length / BATCH_SIZE)} (${batch.length} identities)`);
           } catch (error) {
-            const msg = `Failed to import identity batch ${Math.floor(i / BATCH_SIZE) + 1}: ${(error as Error).message}`;
-            logger.warn(msg);
-            errors.push(msg);
+            // Batch failed — retry records individually to save valid ones
+            const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+            logger.warn(`Identity batch ${batchNum} failed, retrying ${batch.length} identities individually...`);
+            for (const identity of batch) {
+              try {
+                await this.importIdentitiesBatch([identity], client);
+                identitiesImported++;
+              } catch (individualError) {
+                const msg = `Failed to import identity ${identity.id}: ${(individualError as Error).message}`;
+                logger.warn(msg);
+                errors.push(msg);
+              }
+            }
           }
         }
       }

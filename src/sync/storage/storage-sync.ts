@@ -59,14 +59,19 @@ export class StorageSync {
     let offset = 0;
     const limit = 1000;
 
+    logger.debug(`Listing files in bucket "${bucketName}" with prefix "${prefix || '(root)'}"`);
+
     while (true) {
       const { data, error } = await this.sourceSupabase.storage
         .from(bucketName)
-        .list(prefix, { limit, offset });
+        .list(prefix || undefined, { limit, offset });
 
       if (error) {
+        logger.error(`Storage list error for ${bucketName}/${prefix}: ${JSON.stringify(error)}`);
         throw new Error(`Failed to list files in ${bucketName}/${prefix}: ${error.message}`);
       }
+
+      logger.debug(`  ${bucketName}/${prefix || '(root)'}: got ${data?.length ?? 0} items (offset=${offset})`);
 
       if (!data || data.length === 0) break;
 
@@ -86,6 +91,7 @@ export class StorageSync {
           });
         } else {
           // It's a folder, recurse
+          logger.debug(`    Recursing into folder: ${fullPath}`);
           const subFiles = await this.listAllFiles(bucketName, fullPath);
           allFiles.push(...subFiles);
         }
@@ -140,12 +146,19 @@ export class StorageSync {
     const files = await this.listAllFiles(bucket.name);
     logger.info(`Found ${files.length} files in bucket ${bucket.name}`);
 
+    if (files.length === 0) {
+      logger.warn(
+        `Bucket "${bucket.name}" returned 0 files from the Storage API. ` +
+        `This may indicate: (1) the bucket is truly empty, (2) the Storage API URL is incorrect ` +
+        `for self-hosted instances, or (3) the service role key lacks storage permissions. ` +
+        `Check that the source API URL is correct and that the key has storage.objects read access.`
+      );
+    }
+
     let uploaded = 0;
     let failed = 0;
 
-    // Adaptive concurrency configuration
     const LARGE_FILE_THRESHOLD = 10 * 1024 * 1024; // 10MB in bytes
-    const LARGE_FILE_CONCURRENCY = 2; // Max concurrent large files
     const configuredConcurrency = this.config.options.storage.concurrency;
 
     // Separate files into large and small based on threshold
@@ -156,14 +169,13 @@ export class StorageSync {
       logger.info(`Bucket ${bucket.name}: ${largeFiles.length} large files (>=10MB), ${smallFiles.length} small files`);
     }
 
-    // Create separate limiters for large and small files
-    // Large files use reduced concurrency to limit memory usage
-    const largFileLimit = pLimit(LARGE_FILE_CONCURRENCY);
-    const smallFileLimit = pLimit(configuredConcurrency);
+    // Use a single limiter to ensure total concurrency never exceeds the configured limit.
+    // Process small files first, then large files, so large files don't block small ones.
+    const limit = pLimit(configuredConcurrency);
+    const allFiles = [...smallFiles, ...largeFiles];
 
-    // Helper to sync a file with the appropriate limiter
-    const syncWithLimit = (file: StorageFile, limiter: ReturnType<typeof pLimit>) => {
-      return limiter(async () => {
+    await Promise.allSettled(
+      allFiles.map(file => limit(async () => {
         try {
           await this.syncFile(bucket.name, file.name);
           uploaded++;
@@ -171,18 +183,9 @@ export class StorageSync {
         } catch (error) {
           failed++;
           logger.warn(`Failed to sync file ${bucket.name}/${file.name}: ${(error as Error).message}`);
-          throw error;
         }
-      });
-    };
-
-    // Process small files first with higher concurrency, then large files with reduced concurrency
-    // This approach ensures large files don't block small files and memory stays bounded
-    const smallFilePromises = smallFiles.map(file => syncWithLimit(file, smallFileLimit));
-    const largeFilePromises = largeFiles.map(file => syncWithLimit(file, largFileLimit));
-
-    // Run both sets concurrently but with their respective limits
-    await Promise.allSettled([...smallFilePromises, ...largeFilePromises]);
+      }))
+    );
 
     logger.info(`Bucket ${bucket.name}: ${uploaded} uploaded, ${failed} failed`);
 
