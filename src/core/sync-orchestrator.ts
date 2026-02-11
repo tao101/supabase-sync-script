@@ -235,17 +235,8 @@ export class SyncOrchestrator {
     if (!this.targetPool) return;
 
     if (this.config.options.components.data && this.sourcePool) {
-      // Verify row counts - FAIL if mismatch
+      // Row count verification is handled by DataSync.sync() directly after import
       const dataSync = new DataSync(this.config, this.tempFileManager, this.targetPool);
-      const countsMatch = await dataSync.verifyDataCounts(this.sourcePool);
-      if (!countsMatch) {
-        throw new SyncError(
-          'Data verification failed: row counts do not match between source and target',
-          ErrorCategory.VALIDATION,
-          'verify',
-          false
-        );
-      }
 
       // Verify foreign key integrity - FAIL if orphaned records found
       const fkValid = await dataSync.verifyForeignKeys();
