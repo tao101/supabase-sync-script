@@ -69,7 +69,6 @@ export class SchemaSync {
       const result = await execa('psql', [
         targetDbUrl,
         '-f', processedFile,
-        '--single-transaction',
         '-v', 'ON_ERROR_STOP=0', // Continue on errors (some objects may already exist)
       ], {
         env: { ...process.env, PGPASSWORD: this.config.target.dbPassword },
