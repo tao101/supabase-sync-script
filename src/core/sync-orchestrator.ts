@@ -234,7 +234,7 @@ export class SyncOrchestrator {
 
     if (!this.targetPool) return;
 
-    if (this.config.options.components.data && this.sourcePool) {
+    if (this.config.options.components.data) {
       // Row count verification is handled by DataSync.sync() directly after import
       const dataSync = new DataSync(this.config, this.tempFileManager, this.targetPool);
 

@@ -41,7 +41,6 @@ export class DataSync {
       '--quote-all-identifiers',
       '--no-owner',
       '--no-privileges',
-      '--disable-triggers',
       '-f', dumpFile,
     ];
 
@@ -143,6 +142,7 @@ export class DataSync {
           // Filter out expected errors for system tables
           if (line.includes('must be owner of')) return false; // System tables owned by supabase_admin
           if (line.includes('permission denied')) return false; // System table permissions
+          if (line.includes('current transaction is aborted')) return false; // Cascading from other errors
           return true;
         });
         if (criticalErrorLines.length > 0) {
@@ -254,6 +254,19 @@ export class DataSync {
           })
         )
       );
+
+      // Check for failed count queries — if any failed, verification cannot be trusted
+      const failures = countResults.filter(result => !result.success);
+      if (failures.length > 0) {
+        logger.warn(`${failures.length}/${countResults.length} table count verifications failed:`);
+        for (const f of failures.slice(0, 10)) {
+          logger.warn(`  ${f.table}: count query failed`);
+        }
+        if (failures.length > 10) {
+          logger.warn(`  ... and ${failures.length - 10} more failures`);
+        }
+        return false;
+      }
 
       // Filter for mismatches (only from successful queries)
       const mismatches = countResults.filter(
