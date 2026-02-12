@@ -149,8 +149,13 @@ export class DataSync {
         }
       }
 
-      // Don't reset session_replication_role here - it will be done after import
     } finally {
+      // Reset session state before returning connection to pool
+      try {
+        await client.query('SET session_replication_role = DEFAULT;');
+      } catch {
+        // Best-effort reset — connection will be discarded by pool if broken
+      }
       client.release();
     }
   }
@@ -163,10 +168,8 @@ export class DataSync {
     try {
       // Use -c to set session_replication_role before importing
       // This disables triggers and allows data import without constraint checks
-      // Use --single-transaction to ensure atomicity - if import fails, all changes are rolled back
       const result = await execa('psql', [
         targetDbUrl,
-        '--single-transaction',
         '-c', 'SET session_replication_role = replica;',
         '-f', dumpFile,
       ], {
