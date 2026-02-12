@@ -61,7 +61,6 @@ export class DataSync {
       '--quote-all-identifiers',
       '--no-owner',
       '--no-privileges',
-      '--disable-triggers',
       '-f', dumpFile,
     ];
 
@@ -201,6 +200,7 @@ export class DataSync {
           // Filter out expected errors for system tables
           if (line.includes('must be owner of')) return false; // System tables owned by supabase_admin
           if (line.includes('permission denied')) return false; // System table permissions
+          if (line.includes('current transaction is aborted')) return false; // Cascading from other errors
           return true;
         });
         if (errorLines.length > 0) {
@@ -281,14 +281,24 @@ export class DataSync {
             });
           }
         } catch (error) {
-          logger.debug(`Could not verify ${tableName}: ${(error as Error).message}`);
+          logger.warn(`Could not verify ${tableName}: ${(error as Error).message}`);
+          // Track as a mismatch with -1 to signal verification failure
+          mismatches.push({
+            table: `${tableName} (VERIFICATION FAILED)`,
+            source: -1,
+            target: -1,
+          });
         }
       }
 
       if (mismatches.length > 0) {
-        logger.warn(`Found ${mismatches.length} tables with row count mismatches:`);
+        logger.warn(`Found ${mismatches.length} tables with row count mismatches or verification failures:`);
         for (const m of mismatches.slice(0, 20)) {
-          logger.warn(`  ${m.table}: source=${m.source}, target=${m.target}`);
+          if (m.source === -1) {
+            logger.warn(`  ${m.table}`);
+          } else {
+            logger.warn(`  ${m.table}: source=${m.source}, target=${m.target}`);
+          }
         }
         if (mismatches.length > 20) {
           logger.warn(`  ... and ${mismatches.length - 20} more`);
