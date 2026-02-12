@@ -377,6 +377,7 @@ export class DataSync {
         parentTable: string;
         orphanCount: number;
       }[] = [];
+      let queryFailures = 0;
 
       for (const fk of fkResult.rows) {
         const childTable = `"${fk.child_schema}"."${fk.child_table}"`;
@@ -416,10 +417,17 @@ export class DataSync {
             });
           }
         } catch (error) {
+          queryFailures++;
           logger.debug(
             `Could not verify FK ${fk.constraint_name}: ${(error as Error).message}`
           );
         }
+      }
+
+      // If any FK check queries failed, verification cannot be trusted
+      if (queryFailures > 0) {
+        logger.warn(`${queryFailures}/${fkResult.rows.length} FK verification queries failed`);
+        return false;
       }
 
       if (violations.length > 0) {
