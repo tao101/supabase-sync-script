@@ -452,8 +452,8 @@ export class DataSync {
     const dumpFile = await this.exportData();
 
     // Clear existing data and import new data
-    // Note: importData() uses psql with --single-transaction and sets session_replication_role = replica
-    // within that transaction, which correctly disables triggers during the import
+    // Note: importData() uses psql -c to set session_replication_role = replica
+    // which disables triggers during the import
     await this.clearTargetData();
     await this.importData(dumpFile);
 
