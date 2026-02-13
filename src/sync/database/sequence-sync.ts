@@ -1,3 +1,4 @@
+import pg from 'pg';
 import type { Config } from '../../types/config.js';
 import { logger } from '../../utils/logger.js';
 import { SyncError, ErrorCategory, SequenceInfo, SequenceResetResult } from '../../types/sync.js';
@@ -47,12 +48,14 @@ export class SequenceSync {
     schemaName: string,
     tableName: string,
     columnName: string,
-    sequenceName: string
+    sequenceName: string,
+    client?: pg.PoolClient
   ): Promise<SequenceResetResult> {
-    const client = await this.targetPool.connect();
+    const ownClient = !client;
+    const dbClient = client ?? await this.targetPool.connect();
     try {
       // Get max value from the table
-      const maxResult = await client.query(
+      const maxResult = await dbClient.query(
         `SELECT COALESCE(MAX("${columnName}"), 0) as max_val FROM "${schemaName}"."${tableName}"`
       );
       const maxVal = parseInt(maxResult.rows[0]?.max_val || '0', 10);
@@ -64,7 +67,7 @@ export class SequenceSync {
       const newValue = maxVal > 0 ? maxVal : 1;
       const isCalled = maxVal > 0;
 
-      await client.query(
+      await dbClient.query(
         `SELECT setval('"${schemaName}"."${sequenceName}"', $1, $2)`,
         [newValue, isCalled]
       );
@@ -80,7 +83,10 @@ export class SequenceSync {
         newValue,
       };
     } finally {
-      client.release();
+      // Only release if we acquired the client ourselves
+      if (ownClient) {
+        dbClient.release();
+      }
     }
   }
 
@@ -90,20 +96,27 @@ export class SequenceSync {
     const sequences = await this.findSequences();
     const results: SequenceResetResult[] = [];
 
-    for (const seq of sequences) {
-      try {
-        const result = await this.resetSequence(
-          seq.schema_name,
-          seq.table_name,
-          seq.column_name,
-          seq.sequence_name
-        );
-        results.push(result);
-      } catch (error) {
-        logger.warn(
-          `Failed to reset sequence ${seq.schema_name}.${seq.sequence_name}: ${(error as Error).message}`
-        );
+    // Acquire a single connection for all sequence resets to avoid pool churn
+    const client = await this.targetPool.connect();
+    try {
+      for (const seq of sequences) {
+        try {
+          const result = await this.resetSequence(
+            seq.schema_name,
+            seq.table_name,
+            seq.column_name,
+            seq.sequence_name,
+            client
+          );
+          results.push(result);
+        } catch (error) {
+          logger.warn(
+            `Failed to reset sequence ${seq.schema_name}.${seq.sequence_name}: ${(error as Error).message}`
+          );
+        }
       }
+    } finally {
+      client.release();
     }
 
     logger.info(`Reset ${results.length} sequences`);
@@ -133,11 +146,14 @@ export class SequenceSync {
           );
           const maxVal = parseInt(maxResult.rows[0]?.max_val || '0', 10);
 
-          // Verify: sequence should be >= max value in table
-          const effectiveSeqValue = isCalled ? lastValue : lastValue - 1;
-          if (effectiveSeqValue < maxVal) {
+          // Verify: next sequence value should be > max value in table
+          // PostgreSQL behavior:
+          // - is_called = true → next value will be last_value + 1
+          // - is_called = false → next value will be last_value
+          const nextValue = isCalled ? lastValue + 1 : lastValue;
+          if (nextValue <= maxVal) {
             logger.warn(
-              `Sequence ${seq.schema_name}.${seq.sequence_name} (${effectiveSeqValue}) < max value in ${seq.schema_name}.${seq.table_name} (${maxVal})`
+              `Sequence ${seq.schema_name}.${seq.sequence_name} next value (${nextValue}) <= max value in ${seq.schema_name}.${seq.table_name} (${maxVal})`
             );
             allValid = false;
           }
@@ -145,6 +161,7 @@ export class SequenceSync {
           logger.warn(
             `Failed to verify sequence ${seq.schema_name}.${seq.sequence_name}: ${(error as Error).message}`
           );
+          allValid = false;
         }
       }
     } finally {

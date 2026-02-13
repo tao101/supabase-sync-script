@@ -3,7 +3,7 @@ import pLimit from 'p-limit';
 import type { Config } from '../../types/config.js';
 import type { PostgresPool } from '../../clients/postgres-client.js';
 import { logger } from '../../utils/logger.js';
-import { StorageSyncResult, BucketSyncResult, StorageBucket, StorageFile } from '../../types/sync.js';
+import { StorageSyncResult, BucketSyncResult, StorageBucket, StorageFile, SyncError, ErrorCategory } from '../../types/sync.js';
 import { withRetry } from '../../utils/retry.js';
 
 export class StorageSync {
@@ -80,11 +80,14 @@ export class StorageSync {
 
         if (item.id) {
           // It's a file
+          // Extract size from metadata (Supabase storage returns size in metadata)
+          const size = (item.metadata as { size?: number })?.size ?? 0;
           allFiles.push({
             name: fullPath,
             id: item.id,
             bucket_id: bucketName,
             metadata: item.metadata || {},
+            size,
           });
         } else {
           // It's a folder, recurse
@@ -155,23 +158,33 @@ export class StorageSync {
     let uploaded = 0;
     let failed = 0;
 
-    // Use concurrency limit for parallel uploads
-    const limit = pLimit(this.config.options.storage.concurrency);
+    const LARGE_FILE_THRESHOLD = 10 * 1024 * 1024; // 10MB in bytes
+    const configuredConcurrency = this.config.options.storage.concurrency;
 
-    const results = await Promise.allSettled(
-      files.map(file =>
-        limit(async () => {
-          try {
-            await this.syncFile(bucket.name, file.name);
-            uploaded++;
-            logger.debug(`Synced file: ${bucket.name}/${file.name}`);
-          } catch (error) {
-            failed++;
-            logger.warn(`Failed to sync file ${bucket.name}/${file.name}: ${(error as Error).message}`);
-            throw error;
-          }
-        })
-      )
+    // Separate files into large and small based on threshold
+    const largeFiles = files.filter(f => f.size >= LARGE_FILE_THRESHOLD);
+    const smallFiles = files.filter(f => f.size < LARGE_FILE_THRESHOLD);
+
+    if (largeFiles.length > 0) {
+      logger.info(`Bucket ${bucket.name}: ${largeFiles.length} large files (>=10MB), ${smallFiles.length} small files`);
+    }
+
+    // Use a single limiter to ensure total concurrency never exceeds the configured limit.
+    // Process small files first, then large files, so large files don't block small ones.
+    const limit = pLimit(configuredConcurrency);
+    const allFiles = [...smallFiles, ...largeFiles];
+
+    await Promise.allSettled(
+      allFiles.map(file => limit(async () => {
+        try {
+          await this.syncFile(bucket.name, file.name);
+          uploaded++;
+          logger.debug(`Synced file: ${bucket.name}/${file.name} (${(file.size / 1024 / 1024).toFixed(2)}MB)`);
+        } catch (error) {
+          failed++;
+          logger.warn(`Failed to sync file ${bucket.name}/${file.name}: ${(error as Error).message}`);
+        }
+      }))
     );
 
     logger.info(`Bucket ${bucket.name}: ${uploaded} uploaded, ${failed} failed`);
@@ -226,6 +239,15 @@ export class StorageSync {
     const totalFailed = results.reduce((sum, r) => sum + r.failed, 0);
 
     logger.info(`Storage sync complete: ${results.length} buckets, ${totalUploaded}/${totalFiles} files, ${totalFailed} failed`);
+
+    if (totalFailed > 0) {
+      throw new SyncError(
+        `Storage sync failed: ${totalFailed}/${totalFiles} files failed to upload`,
+        ErrorCategory.STORAGE,
+        'storage-sync',
+        false
+      );
+    }
 
     // Rewrite storage URLs in database to point to target
     if (this.targetPool) {

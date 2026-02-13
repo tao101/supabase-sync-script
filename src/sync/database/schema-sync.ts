@@ -57,11 +57,10 @@ export class SchemaSync {
     }
   }
 
-  async importSchema(dumpFile: string): Promise<string[]> {
+  async importSchema(dumpFile: string): Promise<void> {
     logger.info('Importing database schema to target...');
 
     const targetDbUrl = this.connectionBuilder.buildDbUrl(this.config.target);
-    const warnings: string[] = [];
 
     // Pre-process the dump file to remove problematic statements
     const processedFile = await this.preprocessDumpFile(dumpFile);
@@ -93,7 +92,12 @@ export class SchemaSync {
           if (errorLines.length > 5) {
             logger.warn(`  ... and ${errorLines.length - 5} more errors`);
           }
-          warnings.push(...errorLines.map(line => line.trim()));
+          throw new SyncError(
+            `Schema import failed with ${errorLines.length} error(s): ${errorLines[0]?.trim() || 'unknown error'}`,
+            ErrorCategory.IMPORT,
+            'schema-import',
+            false
+          );
         }
       }
 
@@ -103,12 +107,17 @@ export class SchemaSync {
         logger.info('Schema imported successfully');
       }
     } catch (error) {
-      // Log but don't fail - some errors are expected (existing objects)
-      logger.warn(`Schema import completed with warnings: ${(error as Error).message}`);
-      warnings.push((error as Error).message);
+      if (error instanceof SyncError) {
+        throw error;
+      }
+      throw new SyncError(
+        `Schema import failed: ${(error as Error).message}`,
+        ErrorCategory.IMPORT,
+        'schema-import',
+        false,
+        error as Error
+      );
     }
-
-    return warnings;
   }
 
   private async preprocessDumpFile(dumpFile: string): Promise<string> {
@@ -135,13 +144,13 @@ export class SchemaSync {
     return processedFile;
   }
 
-  async sync(): Promise<string[]> {
+  async sync(): Promise<void> {
     if (this.config.dryRun) {
       logger.info('[DRY RUN] Would export and import database schema');
-      return [];
+      return;
     }
 
     const dumpFile = await this.exportSchema();
-    return await this.importSchema(dumpFile);
+    await this.importSchema(dumpFile);
   }
 }
