@@ -197,11 +197,9 @@ export class DataSync {
         }
       }
 
-      // Throw error if there are critical errors or non-zero exit code
-      if (criticalErrorLines.length > 0 || result.exitCode !== 0) {
-        const errorSummary = criticalErrorLines.length > 0
-          ? `${criticalErrorLines.length} critical error(s): ${criticalErrorLines[0]?.trim() || 'unknown error'}`
-          : `psql exited with code ${result.exitCode}`;
+      // Throw error only if there are critical (non-expected) errors
+      if (criticalErrorLines.length > 0) {
+        const errorSummary = `${criticalErrorLines.length} critical error(s): ${criticalErrorLines[0]?.trim() || 'unknown error'}`;
 
         if (result.stderr) {
           logger.debug(`psql stderr: ${result.stderr.slice(0, 1000)}`);
@@ -216,7 +214,11 @@ export class DataSync {
         );
       }
 
-      logger.info('Data imported successfully');
+      if (result.exitCode !== 0) {
+        logger.warn(`Data import completed with exit code ${result.exitCode} (some errors may be expected)`);
+      } else {
+        logger.info('Data imported successfully');
+      }
     } catch (error) {
       // Re-throw SyncErrors as-is
       if (error instanceof SyncError) {
