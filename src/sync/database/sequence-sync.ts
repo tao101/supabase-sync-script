@@ -161,6 +161,7 @@ export class SequenceSync {
           logger.warn(
             `Failed to verify sequence ${seq.schema_name}.${seq.sequence_name}: ${(error as Error).message}`
           );
+          allValid = false;
         }
       }
     } finally {
