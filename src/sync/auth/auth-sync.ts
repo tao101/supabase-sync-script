@@ -149,6 +149,22 @@ export class AuthSync {
     await this.importRowsBatch('identities', identities, columns, 'id', client);
   }
 
+  private async runWithSavepoint(
+    client: pg.PoolClient,
+    savepoint: string,
+    fn: () => Promise<void>
+  ): Promise<void> {
+    await client.query(`SAVEPOINT ${savepoint}`);
+    try {
+      await fn();
+      await client.query(`RELEASE SAVEPOINT ${savepoint}`);
+    } catch (error) {
+      await client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+      await client.query(`RELEASE SAVEPOINT ${savepoint}`);
+      throw error;
+    }
+  }
+
   async sync(): Promise<AuthSyncResult> {
     const userColumns = await this.getCommonColumns('users');
     const identityColumns = this.config.options.auth.migrateIdentities
@@ -186,12 +202,15 @@ export class AuthSync {
     const client = await this.targetPool.connect();
     let usersImported = 0;
     let identitiesImported = 0;
+    let transactionStarted = false;
 
     try {
       // Disable triggers/constraints on THIS connection
       // This setting is session-specific and will persist for all operations on this connection
       logger.info('Disabling triggers for auth import...');
       await client.query('SET session_replication_role = replica;');
+      await client.query('BEGIN');
+      transactionStarted = true;
 
       // Clear target using the same connection
       await this.clearTargetAuth(client);
@@ -200,17 +219,22 @@ export class AuthSync {
       logger.info(`Importing ${users.length} users in batches of ${BATCH_SIZE}...`);
       for (let i = 0; i < users.length; i += BATCH_SIZE) {
         const batch = users.slice(i, i + BATCH_SIZE);
+        const batchNum = Math.floor(i / BATCH_SIZE) + 1;
         try {
-          await this.importUsersBatch(batch, userColumns, client);
+          await this.runWithSavepoint(client, `auth_users_batch_${batchNum}`, async () => {
+            await this.importUsersBatch(batch, userColumns, client);
+          });
           usersImported += batch.length;
-          logger.debug(`Imported users batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(users.length / BATCH_SIZE)} (${batch.length} users)`);
+          logger.debug(`Imported users batch ${batchNum}/${Math.ceil(users.length / BATCH_SIZE)} (${batch.length} users)`);
         } catch (error) {
           // Batch failed — retry records individually to save valid ones
-          const batchNum = Math.floor(i / BATCH_SIZE) + 1;
           logger.warn(`User batch ${batchNum} failed, retrying ${batch.length} users individually...`);
-          for (const user of batch) {
+          for (let j = 0; j < batch.length; j++) {
+            const user = batch[j];
             try {
-              await this.importUsersBatch([user], userColumns, client);
+              await this.runWithSavepoint(client, `auth_user_${batchNum}_${j + 1}`, async () => {
+                await this.importUsersBatch([user], userColumns, client);
+              });
               usersImported++;
             } catch (individualError) {
               const msg = `Failed to import user ${String(user.id ?? 'unknown')}: ${(individualError as Error).message}`;
@@ -226,17 +250,22 @@ export class AuthSync {
         logger.info(`Importing ${identities.length} identities in batches of ${BATCH_SIZE}...`);
         for (let i = 0; i < identities.length; i += BATCH_SIZE) {
           const batch = identities.slice(i, i + BATCH_SIZE);
+          const batchNum = Math.floor(i / BATCH_SIZE) + 1;
           try {
-            await this.importIdentitiesBatch(batch, identityColumns, client);
+            await this.runWithSavepoint(client, `auth_identities_batch_${batchNum}`, async () => {
+              await this.importIdentitiesBatch(batch, identityColumns, client);
+            });
             identitiesImported += batch.length;
-            logger.debug(`Imported identities batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(identities.length / BATCH_SIZE)} (${batch.length} identities)`);
+            logger.debug(`Imported identities batch ${batchNum}/${Math.ceil(identities.length / BATCH_SIZE)} (${batch.length} identities)`);
           } catch (error) {
             // Batch failed — retry records individually to save valid ones
-            const batchNum = Math.floor(i / BATCH_SIZE) + 1;
             logger.warn(`Identity batch ${batchNum} failed, retrying ${batch.length} identities individually...`);
-            for (const identity of batch) {
+            for (let j = 0; j < batch.length; j++) {
+              const identity = batch[j];
               try {
-                await this.importIdentitiesBatch([identity], identityColumns, client);
+                await this.runWithSavepoint(client, `auth_identity_${batchNum}_${j + 1}`, async () => {
+                  await this.importIdentitiesBatch([identity], identityColumns, client);
+                });
                 identitiesImported++;
               } catch (individualError) {
                 const msg = `Failed to import identity ${String(identity.id ?? 'unknown')}: ${(individualError as Error).message}`;
@@ -249,6 +278,26 @@ export class AuthSync {
       }
 
       logger.info(`Auth sync complete: ${usersImported}/${users.length} users, ${identitiesImported}/${identities.length} identities`);
+      if (errors.length > 0) {
+        throw new SyncError(
+          `Auth sync failed: ${errors.length} row(s) failed to import: ${errors.slice(0, 3).join('; ')}${errors.length > 3 ? '; ...' : ''}`,
+          ErrorCategory.IMPORT,
+          'auth-sync',
+          false
+        );
+      }
+
+      await client.query('COMMIT');
+      transactionStarted = false;
+    } catch (error) {
+      if (transactionStarted) {
+        try {
+          await client.query('ROLLBACK');
+        } catch (rollbackError) {
+          logger.warn(`Failed to roll back auth import transaction: ${(rollbackError as Error).message}`);
+        }
+      }
+      throw error;
     } finally {
       // Re-enable triggers/constraints before releasing the connection
       let resetSucceeded = false;
@@ -261,15 +310,6 @@ export class AuthSync {
       }
       // Pass true to destroy connection if reset failed (avoids returning dirty connection to pool)
       client.release(!resetSucceeded);
-    }
-
-    if (errors.length > 0) {
-      throw new SyncError(
-        `Auth sync failed: ${errors.length} row(s) failed to import: ${errors.slice(0, 3).join('; ')}${errors.length > 3 ? '; ...' : ''}`,
-        ErrorCategory.IMPORT,
-        'auth-sync',
-        false
-      );
     }
 
     return {
