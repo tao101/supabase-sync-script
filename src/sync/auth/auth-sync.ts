@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import type pg from 'pg';
 import type { Config } from '../../types/config.js';
 import { logger } from '../../utils/logger.js';
@@ -6,6 +7,13 @@ import type { PostgresPool } from '../../clients/postgres-client.js';
 
 const BATCH_SIZE = 500;
 type AuthRow = Record<string, unknown>;
+
+interface IdentityColumnMapping {
+  exportColumns: string[];
+  importColumns: string[];
+  sourceHasProviderId: boolean;
+  targetHasProviderId: boolean;
+}
 
 export class AuthSync {
   constructor(
@@ -55,6 +63,84 @@ export class AuthSync {
     }
 
     return commonColumns;
+  }
+
+  private async getIdentityColumnMapping(): Promise<IdentityColumnMapping> {
+    const [sourceColumns, targetColumns] = await Promise.all([
+      this.getInsertableColumns(this.sourcePool, 'identities'),
+      this.getInsertableColumns(this.targetPool, 'identities'),
+    ]);
+    const sourceColumnSet = new Set(sourceColumns);
+    const targetColumnSet = new Set(targetColumns);
+    const sourceHasProviderId = sourceColumnSet.has('provider_id');
+    const targetHasProviderId = targetColumnSet.has('provider_id');
+    const importColumnSet = new Set(sourceColumns.filter(column => targetColumnSet.has(column)));
+
+    if (targetHasProviderId && !sourceHasProviderId) {
+      if (!sourceColumnSet.has('id')) {
+        throw new SyncError(
+          'Cannot map auth.identities provider_id: source has neither provider_id nor id',
+          ErrorCategory.VALIDATION,
+          'auth-sync',
+          false
+        );
+      }
+      importColumnSet.add('provider_id');
+    }
+
+    if (!targetHasProviderId && sourceHasProviderId) {
+      if (!targetColumnSet.has('id')) {
+        throw new SyncError(
+          'Cannot map auth.identities provider_id: target has neither provider_id nor id',
+          ErrorCategory.VALIDATION,
+          'auth-sync',
+          false
+        );
+      }
+      importColumnSet.add('id');
+    }
+
+    const importColumns = targetColumns.filter(column => importColumnSet.has(column));
+    const exportColumnSet = new Set(importColumns.filter(column => sourceColumnSet.has(column)));
+    if (targetHasProviderId && !sourceHasProviderId) {
+      exportColumnSet.add('id');
+    }
+    if (!targetHasProviderId && sourceHasProviderId) {
+      exportColumnSet.add('provider_id');
+    }
+
+    if (!importColumns.includes('id') && !targetHasProviderId) {
+      throw new SyncError(
+        'Cannot sync auth.identities: source and target do not share an id column',
+        ErrorCategory.VALIDATION,
+        'auth-sync',
+        false
+      );
+    }
+
+    return {
+      exportColumns: sourceColumns.filter(column => exportColumnSet.has(column)),
+      importColumns,
+      sourceHasProviderId,
+      targetHasProviderId,
+    };
+  }
+
+  private mapIdentityRows(rows: AuthRow[], mapping: IdentityColumnMapping): AuthRow[] {
+    if (mapping.sourceHasProviderId === mapping.targetHasProviderId) return rows;
+
+    return rows.map(row => {
+      const mapped = { ...row };
+      if (mapping.targetHasProviderId) {
+        mapped.provider_id = row.id;
+        if (mapping.importColumns.includes('id')) {
+          mapped.id = randomUUID();
+        }
+      } else {
+        mapped.id = row.provider_id ?? row.id;
+      }
+      return mapped;
+    });
   }
 
   private async exportAuthRows(tableName: string, columns: string[], label: string): Promise<AuthRow[]> {
@@ -167,20 +253,20 @@ export class AuthSync {
 
   async sync(): Promise<AuthSyncResult> {
     const userColumns = await this.getCommonColumns('users');
-    const identityColumns = this.config.options.auth.migrateIdentities
-      ? await this.getCommonColumns('identities')
-      : [];
+    const identityMapping = this.config.options.auth.migrateIdentities
+      ? await this.getIdentityColumnMapping()
+      : null;
 
     logger.info(`Auth users sync will copy ${userColumns.length} common columns`);
-    if (this.config.options.auth.migrateIdentities) {
-      logger.info(`Auth identities sync will copy ${identityColumns.length} common columns`);
+    if (identityMapping) {
+      logger.info(`Auth identities sync will copy ${identityMapping.importColumns.length} target columns`);
     }
 
     if (this.config.dryRun) {
       logger.info('[DRY RUN] Would export and import auth users');
       const users = await this.exportUsers(userColumns);
-      const identities = this.config.options.auth.migrateIdentities
-        ? await this.exportIdentities(identityColumns)
+      const identities = identityMapping
+        ? await this.exportIdentities(identityMapping.exportColumns)
         : [];
       return {
         usersImported: users.length,
@@ -193,8 +279,11 @@ export class AuthSync {
 
     // Export from source (can use separate connections - read-only)
     const users = await this.exportUsers(userColumns);
-    const identities = this.config.options.auth.migrateIdentities
-      ? await this.exportIdentities(identityColumns)
+    const identities = identityMapping
+      ? this.mapIdentityRows(
+        await this.exportIdentities(identityMapping.exportColumns),
+        identityMapping
+      )
       : [];
 
     // Acquire a SINGLE connection for ALL import operations
@@ -246,14 +335,14 @@ export class AuthSync {
       }
 
       // Import identities in batches using the same connection
-      if (identities.length > 0) {
+      if (identityMapping && identities.length > 0) {
         logger.info(`Importing ${identities.length} identities in batches of ${BATCH_SIZE}...`);
         for (let i = 0; i < identities.length; i += BATCH_SIZE) {
           const batch = identities.slice(i, i + BATCH_SIZE);
           const batchNum = Math.floor(i / BATCH_SIZE) + 1;
           try {
             await this.runWithSavepoint(client, `auth_identities_batch_${batchNum}`, async () => {
-              await this.importIdentitiesBatch(batch, identityColumns, client);
+              await this.importIdentitiesBatch(batch, identityMapping.importColumns, client);
             });
             identitiesImported += batch.length;
             logger.debug(`Imported identities batch ${batchNum}/${Math.ceil(identities.length / BATCH_SIZE)} (${batch.length} identities)`);
@@ -264,7 +353,7 @@ export class AuthSync {
               const identity = batch[j];
               try {
                 await this.runWithSavepoint(client, `auth_identity_${batchNum}_${j + 1}`, async () => {
-                  await this.importIdentitiesBatch([identity], identityColumns, client);
+                  await this.importIdentitiesBatch([identity], identityMapping.importColumns, client);
                 });
                 identitiesImported++;
               } catch (individualError) {

@@ -298,7 +298,9 @@ export class SchemaSync {
           const quotedSchema = quoteIdentifier(schema);
           await client.query(`DROP SCHEMA IF EXISTS ${quotedSchema} CASCADE`);
           await client.query(`CREATE SCHEMA ${quotedSchema}`);
-          await this.restoreSchemaPrivileges(client, schema, privileges);
+          if (privileges) {
+            await this.restoreSchemaPrivileges(client, schema, privileges);
+          }
         }
         await client.query('COMMIT');
       } catch (error) {
@@ -414,24 +416,6 @@ export class SchemaSync {
     }
   }
 
-  private triggerKey(trigger: PreservedTrigger): string {
-    return `${trigger.schemaName}.${trigger.tableName}.${trigger.triggerName}`;
-  }
-
-  private mergePreservedTriggers(
-    targetTriggers: PreservedTrigger[],
-    sourceTriggers: PreservedTrigger[]
-  ): PreservedTrigger[] {
-    const merged = new Map<string, PreservedTrigger>();
-    for (const trigger of targetTriggers) {
-      merged.set(this.triggerKey(trigger), trigger);
-    }
-    for (const trigger of sourceTriggers) {
-      merged.set(this.triggerKey(trigger), trigger);
-    }
-    return [...merged.values()];
-  }
-
   private async captureSourceExternalDependentTriggers(): Promise<PreservedTrigger[]> {
     if (!this.sourcePool) return [];
 
@@ -453,7 +437,7 @@ export class SchemaSync {
   private async captureSchemaPrivileges(
     client: pg.PoolClient,
     schema: string
-  ): Promise<SchemaPrivilegeState> {
+  ): Promise<SchemaPrivilegeState | null> {
     const ownerResult = await client.query(`
       SELECT r.rolname AS owner
       FROM pg_namespace n
@@ -461,14 +445,7 @@ export class SchemaSync {
       WHERE n.nspname = $1
     `, [schema]);
 
-    if (ownerResult.rows.length === 0) {
-      throw new SyncError(
-        `Schema not found while capturing privileges: ${schema}`,
-        ErrorCategory.IMPORT,
-        'schema-reset',
-        false
-      );
-    }
+    if (ownerResult.rows.length === 0) return null;
 
     const schemaGrantsResult = await client.query(`
       SELECT
@@ -586,8 +563,6 @@ export class SchemaSync {
       }
       throw error;
     }
-    await this.restorePreservedTriggers(
-      this.mergePreservedTriggers(preservedTriggers, sourceTriggers)
-    );
+    await this.restorePreservedTriggers(sourceTriggers);
   }
 }
