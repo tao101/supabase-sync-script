@@ -1,6 +1,8 @@
 import { execa } from 'execa';
+import { once } from 'events';
 import { createReadStream, createWriteStream } from 'fs';
 import { createInterface } from 'readline';
+import { finished } from 'stream/promises';
 import pLimit from 'p-limit';
 import type { Config } from '../../types/config.js';
 import { ConnectionBuilder } from '../../config/connection-builder.js';
@@ -176,9 +178,9 @@ export class DataSync {
     logger.info('Importing database data to target...');
 
     const targetDbUrl = this.connectionBuilder.buildDbUrl(this.config.target);
-    const processedFile = await this.preprocessDumpFile(dumpFile);
 
     try {
+      const processedFile = await this.preprocessDumpFile(dumpFile);
       // Use -c to set session_replication_role before importing
       // This disables triggers and allows data import without constraint checks
       const result = await execa('psql', [
@@ -497,13 +499,15 @@ export class DataSync {
     const input = createReadStream(dumpFile, { encoding: 'utf8' });
     const output = createWriteStream(processedFile, { mode: 0o600 });
     const lines = createInterface({ input, crlfDelay: Infinity });
+    const outputFinished = finished(output);
+    void outputFinished.catch(() => undefined);
     let inCopyBlock = false;
 
     try {
       for await (const line of lines) {
         if (!inCopyBlock && /^SET transaction_timeout = [^;]+;$/i.test(line.trim())) continue;
         if (!output.write(`${line}\n`)) {
-          await new Promise<void>(resolve => output.once('drain', resolve));
+          await Promise.race([once(output, 'drain'), outputFinished]);
         }
         if (inCopyBlock && line === '\\.') {
           inCopyBlock = false;
@@ -511,14 +515,20 @@ export class DataSync {
           inCopyBlock = true;
         }
       }
+    } catch (error) {
+      output.destroy();
+      try {
+        await outputFinished;
+      } catch {
+        // Preserve the original read/write failure.
+      }
+      throw error;
     } finally {
       lines.close();
     }
 
-    await new Promise<void>((resolve, reject) => {
-      output.end(resolve);
-      output.on('error', reject);
-    });
+    output.end();
+    await outputFinished;
 
     return processedFile;
   }
