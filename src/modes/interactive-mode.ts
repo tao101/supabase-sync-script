@@ -354,7 +354,7 @@ export async function gatherFullConfig(): Promise<Config> {
         roles: true,
       },
       database: {
-        includeSchemas: ['public', 'auth', 'storage'],
+        includeSchemas: ['public'],
         excludeSchemas: ['pg_catalog', 'information_schema', 'pg_toast'],
         excludeTables: [],
       },
