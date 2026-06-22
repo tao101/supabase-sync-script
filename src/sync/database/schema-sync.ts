@@ -20,6 +20,7 @@ interface DefaultPrivilegeGrant extends SchemaGrant {
 }
 
 interface SchemaPrivilegeState {
+  owner: string;
   schemaGrants: SchemaGrant[];
   defaultPrivilegeGrants: DefaultPrivilegeGrant[];
 }
@@ -38,7 +39,8 @@ export class SchemaSync {
   constructor(
     private config: Config,
     private tempFileManager: TempFileManager,
-    private targetPool: PostgresPool
+    private targetPool: PostgresPool,
+    private sourcePool?: PostgresPool
   ) {
     this.connectionBuilder = new ConnectionBuilder();
   }
@@ -289,12 +291,19 @@ export class SchemaSync {
         );
       }
 
-      for (const schema of schemas) {
-        const privileges = await this.captureSchemaPrivileges(client, schema);
-        const quotedSchema = quoteIdentifier(schema);
-        await client.query(`DROP SCHEMA IF EXISTS ${quotedSchema} CASCADE`);
-        await client.query(`CREATE SCHEMA ${quotedSchema}`);
-        await this.restoreSchemaPrivileges(client, schema, privileges);
+      await client.query('BEGIN');
+      try {
+        for (const schema of schemas) {
+          const privileges = await this.captureSchemaPrivileges(client, schema);
+          const quotedSchema = quoteIdentifier(schema);
+          await client.query(`DROP SCHEMA IF EXISTS ${quotedSchema} CASCADE`);
+          await client.query(`CREATE SCHEMA ${quotedSchema}`);
+          await this.restoreSchemaPrivileges(client, schema, privileges);
+        }
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
       }
 
       return preservedTriggers;
@@ -405,10 +414,62 @@ export class SchemaSync {
     }
   }
 
+  private triggerKey(trigger: PreservedTrigger): string {
+    return `${trigger.schemaName}.${trigger.tableName}.${trigger.triggerName}`;
+  }
+
+  private mergePreservedTriggers(
+    targetTriggers: PreservedTrigger[],
+    sourceTriggers: PreservedTrigger[]
+  ): PreservedTrigger[] {
+    const merged = new Map<string, PreservedTrigger>();
+    for (const trigger of targetTriggers) {
+      merged.set(this.triggerKey(trigger), trigger);
+    }
+    for (const trigger of sourceTriggers) {
+      merged.set(this.triggerKey(trigger), trigger);
+    }
+    return [...merged.values()];
+  }
+
+  private async captureSourceExternalDependentTriggers(): Promise<PreservedTrigger[]> {
+    if (!this.sourcePool) return [];
+
+    const schemas = getApplicationSchemas(this.config);
+    if (schemas.length === 0) return [];
+
+    const client = await this.sourcePool.connect();
+    try {
+      const triggers = await this.captureExternalDependentTriggers(client, schemas);
+      if (triggers.length > 0) {
+        logger.info(`Captured ${triggers.length} source external trigger(s) that depend on application schemas`);
+      }
+      return triggers;
+    } finally {
+      client.release();
+    }
+  }
+
   private async captureSchemaPrivileges(
     client: pg.PoolClient,
     schema: string
   ): Promise<SchemaPrivilegeState> {
+    const ownerResult = await client.query(`
+      SELECT r.rolname AS owner
+      FROM pg_namespace n
+      JOIN pg_roles r ON r.oid = n.nspowner
+      WHERE n.nspname = $1
+    `, [schema]);
+
+    if (ownerResult.rows.length === 0) {
+      throw new SyncError(
+        `Schema not found while capturing privileges: ${schema}`,
+        ErrorCategory.IMPORT,
+        'schema-reset',
+        false
+      );
+    }
+
     const schemaGrantsResult = await client.query(`
       SELECT
         COALESCE(grantee.rolname, 'PUBLIC') AS grantee,
@@ -442,6 +503,7 @@ export class SchemaSync {
     `, [schema]);
 
     return {
+      owner: ownerResult.rows[0].owner,
       schemaGrants: schemaGrantsResult.rows.map(row => ({
         grantee: row.grantee,
         privilegeType: row.privilege_type,
@@ -463,6 +525,10 @@ export class SchemaSync {
     state: SchemaPrivilegeState
   ): Promise<void> {
     const quotedSchema = quoteIdentifier(schema);
+
+    await client.query(
+      `ALTER SCHEMA ${quotedSchema} OWNER TO ${this.quoteRole(state.owner)}`
+    );
 
     for (const grant of state.schemaGrants) {
       await client.query(
@@ -508,6 +574,7 @@ export class SchemaSync {
     }
 
     const dumpFile = await this.exportSchema();
+    const sourceTriggers = await this.captureSourceExternalDependentTriggers();
     const preservedTriggers = await this.resetTargetSchemas();
     try {
       await this.importSchema(dumpFile);
@@ -519,6 +586,8 @@ export class SchemaSync {
       }
       throw error;
     }
-    await this.restorePreservedTriggers(preservedTriggers);
+    await this.restorePreservedTriggers(
+      this.mergePreservedTriggers(preservedTriggers, sourceTriggers)
+    );
   }
 }
