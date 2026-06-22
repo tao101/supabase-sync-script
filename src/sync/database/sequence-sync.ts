@@ -3,6 +3,7 @@ import type { Config } from '../../types/config.js';
 import { logger } from '../../utils/logger.js';
 import { SyncError, ErrorCategory, SequenceInfo, SequenceResetResult } from '../../types/sync.js';
 import type { PostgresPool } from '../../clients/postgres-client.js';
+import { getApplicationSchemas } from './schemas.js';
 
 // Query to find all sequences and their owning tables/columns
 const FIND_SEQUENCES_QUERY = `
@@ -34,7 +35,7 @@ export class SequenceSync {
     const client = await this.targetPool.connect();
     try {
       const result = await client.query(FIND_SEQUENCES_QUERY, [
-        this.config.options.database.includeSchemas,
+        getApplicationSchemas(this.config),
       ]);
 
       logger.info(`Found ${result.rows.length} sequences`);
