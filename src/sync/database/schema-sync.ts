@@ -56,7 +56,6 @@ export class SchemaSync {
       '--schema-only',
       '--quote-all-identifiers',
       '--no-owner',
-      '--no-privileges',
       '--no-subscriptions',
       '--no-publications',
       '-f', dumpFile,
@@ -378,7 +377,10 @@ export class SchemaSync {
     logger.info(`Restoring ${triggers.length} preserved external trigger(s)...`);
 
     const client = await this.targetPool.connect();
+    let transactionStarted = false;
     try {
+      await client.query('BEGIN');
+      transactionStarted = true;
       for (const trigger of triggers) {
         await client.query(
           `DROP TRIGGER IF EXISTS ${quoteIdentifier(trigger.triggerName)} ON ${quoteIdentifier(trigger.schemaName)}.${quoteIdentifier(trigger.tableName)}`
@@ -388,7 +390,16 @@ export class SchemaSync {
           `ALTER TABLE ${quoteIdentifier(trigger.schemaName)}.${quoteIdentifier(trigger.tableName)} ${this.triggerEnabledAction(trigger.enabledMode)} TRIGGER ${quoteIdentifier(trigger.triggerName)}`
         );
       }
+      await client.query('COMMIT');
+      transactionStarted = false;
     } catch (error) {
+      if (transactionStarted) {
+        try {
+          await client.query('ROLLBACK');
+        } catch (rollbackError) {
+          logger.warn(`Failed to roll back preserved trigger restore: ${(rollbackError as Error).message}`);
+        }
+      }
       throw new SyncError(
         `Failed to restore preserved triggers: ${(error as Error).message}`,
         ErrorCategory.IMPORT,
@@ -533,9 +544,6 @@ export class SchemaSync {
       .replace(/COMMENT ON EXTENSION [^;]+;/gi, '')
       // Remove role-related statements (handled separately)
       .replace(/ALTER [^;]+ OWNER TO [^;]+;/gi, '')
-      // Remove grant statements
-      .replace(/GRANT [^;]+;/gi, '')
-      .replace(/REVOKE [^;]+;/gi, '')
       // Remove problematic Supabase-specific objects
       .replace(/CREATE POLICY [^;]+ ON "auth"\."[^"]+" [^;]+;/gi, '')
       .replace(/CREATE POLICY [^;]+ ON "storage"\."[^"]+" [^;]+;/gi, '');
@@ -557,14 +565,14 @@ export class SchemaSync {
     const preservedTriggers = await this.resetTargetSchemas();
     try {
       await this.importSchema(dumpFile);
+      await this.restorePreservedTriggers(sourceTriggers);
     } catch (error) {
       try {
         await this.restorePreservedTriggers(preservedTriggers);
       } catch (restoreError) {
-        logger.warn(`Failed to restore preserved triggers after schema import failure: ${(restoreError as Error).message}`);
+        logger.warn(`Failed to restore preserved triggers after schema sync failure: ${(restoreError as Error).message}`);
       }
       throw error;
     }
-    await this.restorePreservedTriggers(sourceTriggers);
   }
 }
