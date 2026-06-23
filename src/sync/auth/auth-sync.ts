@@ -190,7 +190,7 @@ export class AuthSync {
     tableName: string,
     rows: AuthRow[],
     columns: string[],
-    conflictColumn: string,
+    conflictColumns: string[],
     client: pg.PoolClient
   ): Promise<void> {
     if (rows.length === 0) return;
@@ -204,18 +204,20 @@ export class AuthSync {
       return `(${placeholders.join(', ')})`;
     });
     const quotedColumns = columns.map(column => this.quoteIdentifier(column)).join(', ');
-    const quotedConflictColumn = this.quoteIdentifier(conflictColumn);
-    const updateColumns = columns.filter(column => column !== conflictColumn);
-    const conflictAction = updateColumns.length > 0
-      ? `DO UPDATE SET ${updateColumns
-        .map(column => `${this.quoteIdentifier(column)} = EXCLUDED.${this.quoteIdentifier(column)}`)
-        .join(', ')}`
-      : 'DO NOTHING';
+    const quotedConflictColumns = conflictColumns.map(column => this.quoteIdentifier(column)).join(', ');
+    const updateColumns = columns.filter(column => !conflictColumns.includes(column));
+    const conflictClause = conflictColumns.length > 0
+      ? `ON CONFLICT (${quotedConflictColumns}) ${updateColumns.length > 0
+        ? `DO UPDATE SET ${updateColumns
+          .map(column => `${this.quoteIdentifier(column)} = EXCLUDED.${this.quoteIdentifier(column)}`)
+          .join(', ')}`
+        : 'DO NOTHING'}`
+      : '';
 
     await client.query(`
       INSERT INTO auth.${this.quoteIdentifier(tableName)} (${quotedColumns})
       VALUES ${valuePlaceholders.join(', ')}
-      ON CONFLICT (${quotedConflictColumn}) ${conflictAction}
+      ${conflictClause}
     `, values);
   }
 
@@ -224,15 +226,25 @@ export class AuthSync {
     columns: string[],
     client: pg.PoolClient
   ): Promise<void> {
-    await this.importRowsBatch('users', users, columns, 'id', client);
+    await this.importRowsBatch('users', users, columns, ['id'], client);
   }
 
   private async importIdentitiesBatch(
     identities: AuthRow[],
     columns: string[],
+    conflictColumns: string[],
     client: pg.PoolClient
   ): Promise<void> {
-    await this.importRowsBatch('identities', identities, columns, 'id', client);
+    await this.importRowsBatch('identities', identities, columns, conflictColumns, client);
+  }
+
+  private getIdentityConflictColumns(mapping: IdentityColumnMapping): string[] {
+    if (!mapping.targetHasProviderId) {
+      return mapping.importColumns.includes('provider') && mapping.importColumns.includes('id')
+        ? ['provider', 'id']
+        : [];
+    }
+    return mapping.importColumns.includes('id') ? ['id'] : [];
   }
 
   private async runWithSavepoint(
@@ -292,6 +304,9 @@ export class AuthSync {
         identityMapping
       )
       : [];
+    const identityConflictColumns = identityMapping
+      ? this.getIdentityConflictColumns(identityMapping)
+      : [];
 
     // Acquire a SINGLE connection for ALL import operations
     // This ensures session_replication_role = replica is applied consistently
@@ -349,7 +364,7 @@ export class AuthSync {
           const batchNum = Math.floor(i / BATCH_SIZE) + 1;
           try {
             await this.runWithSavepoint(client, `auth_identities_batch_${batchNum}`, async () => {
-              await this.importIdentitiesBatch(batch, identityMapping.importColumns, client);
+              await this.importIdentitiesBatch(batch, identityMapping.importColumns, identityConflictColumns, client);
             });
             identitiesImported += batch.length;
             logger.debug(`Imported identities batch ${batchNum}/${Math.ceil(identities.length / BATCH_SIZE)} (${batch.length} identities)`);
@@ -360,7 +375,7 @@ export class AuthSync {
               const identity = batch[j];
               try {
                 await this.runWithSavepoint(client, `auth_identity_${batchNum}_${j + 1}`, async () => {
-                  await this.importIdentitiesBatch([identity], identityMapping.importColumns, client);
+                  await this.importIdentitiesBatch([identity], identityMapping.importColumns, identityConflictColumns, client);
                 });
                 identitiesImported++;
               } catch (individualError) {
