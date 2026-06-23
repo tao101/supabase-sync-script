@@ -251,6 +251,13 @@ export class AuthSync {
     }
   }
 
+  private sanitizedDatabaseError(error: unknown): string {
+    const pgError = error as { code?: string; constraint?: string };
+    if (!pgError.code) return 'database rejected row';
+
+    return `Postgres error ${pgError.code}${pgError.constraint ? ` (${pgError.constraint})` : ''}`;
+  }
+
   async sync(): Promise<AuthSyncResult> {
     const userColumns = await this.getCommonColumns('users');
     const identityMapping = this.config.options.auth.migrateIdentities
@@ -326,7 +333,7 @@ export class AuthSync {
               });
               usersImported++;
             } catch (individualError) {
-              const msg = `Failed to import user ${String(user.id ?? 'unknown')}: ${(individualError as Error).message}`;
+              const msg = `Failed to import user at source row ${i + j + 1}: ${this.sanitizedDatabaseError(individualError)}`;
               logger.warn(msg);
               errors.push(msg);
             }
@@ -357,7 +364,7 @@ export class AuthSync {
                 });
                 identitiesImported++;
               } catch (individualError) {
-                const msg = `Failed to import identity ${String(identity.id ?? 'unknown')}: ${(individualError as Error).message}`;
+                const msg = `Failed to import identity at source row ${i + j + 1}: ${this.sanitizedDatabaseError(individualError)}`;
                 logger.warn(msg);
                 errors.push(msg);
               }
