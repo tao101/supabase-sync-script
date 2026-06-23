@@ -190,7 +190,13 @@ export class SyncOrchestrator {
   }
 
   private async syncSchema(): Promise<void> {
-    const schemaSync = new SchemaSync(this.config, this.tempFileManager);
+    if (!this.sourcePool || !this.targetPool) throw new Error('Pools not initialized');
+    const schemaSync = new SchemaSync(
+      this.config,
+      this.tempFileManager,
+      this.targetPool,
+      this.sourcePool
+    );
     await schemaSync.sync();
   }
 

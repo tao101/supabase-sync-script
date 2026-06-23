@@ -35,7 +35,7 @@ export const SyncOptionsSchema = z.object({
   database: z.object({
     excludeSchemas: z.array(z.string()).default(['pg_catalog', 'information_schema', 'pg_toast']),
     excludeTables: z.array(z.string()).default([]),
-    includeSchemas: z.array(z.string()).default(['public', 'auth', 'storage']),
+    includeSchemas: z.array(z.string()).default(['public']),
   }).default({}),
   storage: z.object({
     excludeBuckets: z.array(z.string()).default([]),

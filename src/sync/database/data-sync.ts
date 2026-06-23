@@ -1,4 +1,8 @@
 import { execa } from 'execa';
+import { once } from 'events';
+import { createReadStream, createWriteStream } from 'fs';
+import { createInterface } from 'readline';
+import { finished } from 'stream/promises';
 import pLimit from 'p-limit';
 import type { Config } from '../../types/config.js';
 import { ConnectionBuilder } from '../../config/connection-builder.js';
@@ -6,6 +10,7 @@ import { TempFileManager } from '../../utils/temp-files.js';
 import { logger } from '../../utils/logger.js';
 import { SyncError, ErrorCategory } from '../../types/sync.js';
 import type { PostgresPool } from '../../clients/postgres-client.js';
+import { getApplicationSchemas } from './schemas.js';
 
 /**
  * System tables that should be excluded from data sync operations.
@@ -76,8 +81,17 @@ export class DataSync {
       '-f', dumpFile,
     ];
 
-    // Include specific schemas
-    for (const schema of this.config.options.database.includeSchemas) {
+    const schemas = getApplicationSchemas(this.config);
+    if (schemas.length === 0) {
+      throw new SyncError(
+        'No application schemas configured for data sync',
+        ErrorCategory.VALIDATION,
+        'data-export',
+        false
+      );
+    }
+
+    for (const schema of schemas) {
       args.push(`--schema=${schema}`);
     }
 
@@ -121,7 +135,7 @@ export class DataSync {
         WHERE schemaname = ANY($1)
         AND tablename NOT IN (${EXCLUDED_SYSTEM_TABLES.map((_, i) => `$${i + 2}`).join(', ')})
         ORDER BY schemaname, tablename
-      `, [this.config.options.database.includeSchemas, ...EXCLUDED_SYSTEM_TABLES]);
+      `, [getApplicationSchemas(this.config), ...EXCLUDED_SYSTEM_TABLES]);
 
       // Truncate in reverse dependency order (simplified approach)
       await client.query('SET session_replication_role = replica;');
@@ -166,12 +180,13 @@ export class DataSync {
     const targetDbUrl = this.connectionBuilder.buildDbUrl(this.config.target);
 
     try {
+      const processedFile = await this.preprocessDumpFile(dumpFile);
       // Use -c to set session_replication_role before importing
       // This disables triggers and allows data import without constraint checks
       const result = await execa('psql', [
         targetDbUrl,
         '-c', 'SET session_replication_role = replica;',
-        '-f', dumpFile,
+        '-f', processedFile,
       ], {
         env: { ...process.env, PGPASSWORD: this.config.target.dbPassword },
         reject: false, // Don't throw on non-zero exit
@@ -249,7 +264,7 @@ export class DataSync {
         WHERE schemaname = ANY($1)
         AND tablename NOT IN (${EXCLUDED_SYSTEM_TABLES.map((_, i) => `$${i + 2}`).join(', ')})
         ORDER BY schemaname, tablename
-      `, [this.config.options.database.includeSchemas, ...EXCLUDED_SYSTEM_TABLES]);
+      `, [getApplicationSchemas(this.config), ...EXCLUDED_SYSTEM_TABLES]);
 
       // Filter tables to verify
       const tablesToVerify = tablesResult.rows.filter(row => {
@@ -371,7 +386,7 @@ export class DataSync {
         WHERE c.contype = 'f'
           AND child_ns.nspname = ANY($1)
         ORDER BY child_ns.nspname, child_rel.relname, c.conname
-      `, [this.config.options.database.includeSchemas]);
+      `, [getApplicationSchemas(this.config)]);
 
       const violations: {
         constraint: string;
@@ -477,5 +492,44 @@ export class DataSync {
         false
       );
     }
+  }
+
+  private async preprocessDumpFile(dumpFile: string): Promise<string> {
+    const processedFile = await this.tempFileManager.createFile('data_processed', '.sql');
+    const input = createReadStream(dumpFile, { encoding: 'utf8' });
+    const output = createWriteStream(processedFile, { mode: 0o600 });
+    const lines = createInterface({ input, crlfDelay: Infinity });
+    const outputFinished = finished(output);
+    void outputFinished.catch(() => undefined);
+    let inCopyBlock = false;
+
+    try {
+      for await (const line of lines) {
+        if (!inCopyBlock && /^SET transaction_timeout = [^;]+;$/i.test(line.trim())) continue;
+        if (!output.write(`${line}\n`)) {
+          await Promise.race([once(output, 'drain'), outputFinished]);
+        }
+        if (inCopyBlock && line === '\\.') {
+          inCopyBlock = false;
+        } else if (!inCopyBlock && /^COPY .* FROM stdin;$/i.test(line.trim())) {
+          inCopyBlock = true;
+        }
+      }
+    } catch (error) {
+      output.destroy();
+      try {
+        await outputFinished;
+      } catch {
+        // Preserve the original read/write failure.
+      }
+      throw error;
+    } finally {
+      lines.close();
+    }
+
+    output.end();
+    await outputFinished;
+
+    return processedFile;
   }
 }

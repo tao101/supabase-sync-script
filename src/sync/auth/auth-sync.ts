@@ -1,10 +1,19 @@
+import { randomUUID } from 'crypto';
 import type pg from 'pg';
 import type { Config } from '../../types/config.js';
 import { logger } from '../../utils/logger.js';
-import { AuthUser, AuthIdentity, AuthSyncResult } from '../../types/sync.js';
+import { AuthSyncResult, SyncError, ErrorCategory } from '../../types/sync.js';
 import type { PostgresPool } from '../../clients/postgres-client.js';
 
 const BATCH_SIZE = 500;
+type AuthRow = Record<string, unknown>;
+
+interface IdentityColumnMapping {
+  exportColumns: string[];
+  importColumns: string[];
+  sourceHasProviderId: boolean;
+  targetHasProviderId: boolean;
+}
 
 export class AuthSync {
   constructor(
@@ -13,63 +22,155 @@ export class AuthSync {
     private targetPool: PostgresPool
   ) {}
 
-  async exportUsers(): Promise<AuthUser[]> {
-    logger.info('Exporting auth users from source...');
+  private quoteIdentifier(identifier: string): string {
+    return `"${identifier.replace(/"/g, '""')}"`;
+  }
+
+  private async getInsertableColumns(pool: PostgresPool, tableName: string): Promise<string[]> {
+    const client = await pool.connect();
+    try {
+      const result = await client.query(`
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'auth'
+          AND table_name = $1
+          AND is_generated = 'NEVER'
+          AND COALESCE(identity_generation, '') <> 'ALWAYS'
+        ORDER BY ordinal_position
+      `, [tableName]);
+
+      return result.rows.map(row => row.column_name);
+    } finally {
+      client.release();
+    }
+  }
+
+  private async getCommonColumns(tableName: string): Promise<string[]> {
+    const [sourceColumns, targetColumns] = await Promise.all([
+      this.getInsertableColumns(this.sourcePool, tableName),
+      this.getInsertableColumns(this.targetPool, tableName),
+    ]);
+    const targetColumnSet = new Set(targetColumns);
+    const commonColumns = sourceColumns.filter(column => targetColumnSet.has(column));
+
+    if (!commonColumns.includes('id')) {
+      throw new SyncError(
+        `Cannot sync auth.${tableName}: source and target do not share an id column`,
+        ErrorCategory.VALIDATION,
+        'auth-sync',
+        false
+      );
+    }
+
+    return commonColumns;
+  }
+
+  private async getIdentityColumnMapping(): Promise<IdentityColumnMapping> {
+    const [sourceColumns, targetColumns] = await Promise.all([
+      this.getInsertableColumns(this.sourcePool, 'identities'),
+      this.getInsertableColumns(this.targetPool, 'identities'),
+    ]);
+    const sourceColumnSet = new Set(sourceColumns);
+    const targetColumnSet = new Set(targetColumns);
+    const sourceHasProviderId = sourceColumnSet.has('provider_id');
+    const targetHasProviderId = targetColumnSet.has('provider_id');
+    const importColumnSet = new Set(sourceColumns.filter(column => targetColumnSet.has(column)));
+
+    if (targetHasProviderId && !sourceHasProviderId) {
+      if (!sourceColumnSet.has('id')) {
+        throw new SyncError(
+          'Cannot map auth.identities provider_id: source has neither provider_id nor id',
+          ErrorCategory.VALIDATION,
+          'auth-sync',
+          false
+        );
+      }
+      importColumnSet.add('provider_id');
+    }
+
+    if (!targetHasProviderId && sourceHasProviderId) {
+      if (!targetColumnSet.has('id')) {
+        throw new SyncError(
+          'Cannot map auth.identities provider_id: target has neither provider_id nor id',
+          ErrorCategory.VALIDATION,
+          'auth-sync',
+          false
+        );
+      }
+      importColumnSet.add('id');
+    }
+
+    const importColumns = targetColumns.filter(column => importColumnSet.has(column));
+    const exportColumnSet = new Set(importColumns.filter(column => sourceColumnSet.has(column)));
+    if (targetHasProviderId && !sourceHasProviderId) {
+      exportColumnSet.add('id');
+    }
+    if (!targetHasProviderId && sourceHasProviderId) {
+      exportColumnSet.add('provider_id');
+    }
+
+    if (!importColumns.includes('id') && !targetHasProviderId) {
+      throw new SyncError(
+        'Cannot sync auth.identities: source and target do not share an id column',
+        ErrorCategory.VALIDATION,
+        'auth-sync',
+        false
+      );
+    }
+
+    return {
+      exportColumns: sourceColumns.filter(column => exportColumnSet.has(column)),
+      importColumns,
+      sourceHasProviderId,
+      targetHasProviderId,
+    };
+  }
+
+  private mapIdentityRows(rows: AuthRow[], mapping: IdentityColumnMapping): AuthRow[] {
+    if (mapping.sourceHasProviderId === mapping.targetHasProviderId) return rows;
+
+    return rows.map(row => {
+      const mapped = { ...row };
+      if (mapping.targetHasProviderId) {
+        mapped.provider_id = row.id;
+        if (mapping.importColumns.includes('id')) {
+          mapped.id = randomUUID();
+        }
+      } else {
+        mapped.id = row.provider_id ?? row.id;
+      }
+      return mapped;
+    });
+  }
+
+  private async exportAuthRows(tableName: string, columns: string[], label: string): Promise<AuthRow[]> {
+    logger.info(`Exporting auth ${label} from source...`);
 
     const client = await this.sourcePool.connect();
     try {
+      const columnList = columns.map(column => this.quoteIdentifier(column)).join(', ');
+      const orderColumn = columns.includes('created_at') ? 'created_at' : columns[0];
       const result = await client.query(`
-        SELECT
-          id,
-          email,
-          phone,
-          encrypted_password,
-          email_confirmed_at,
-          phone_confirmed_at,
-          raw_user_meta_data,
-          raw_app_meta_data,
-          created_at,
-          updated_at,
-          banned_until,
-          confirmation_token,
-          recovery_token,
-          email_change_token_new,
-          email_change
-        FROM auth.users
-        ORDER BY created_at
+        SELECT ${columnList}
+        FROM auth.${this.quoteIdentifier(tableName)}
+        ORDER BY ${this.quoteIdentifier(orderColumn)}
       `);
 
-      logger.info(`Exported ${result.rows.length} users`);
+      logger.info(`Exported ${result.rows.length} ${label}`);
       return result.rows;
     } finally {
       client.release();
     }
   }
 
-  async exportIdentities(): Promise<AuthIdentity[]> {
-    logger.info('Exporting auth identities from source...');
+  async exportUsers(columns?: string[]): Promise<AuthRow[]> {
+    const selectedColumns = columns ?? await this.getInsertableColumns(this.sourcePool, 'users');
+    return this.exportAuthRows('users', selectedColumns, 'users');
+  }
 
-    const client = await this.sourcePool.connect();
-    try {
-      const result = await client.query(`
-        SELECT
-          id,
-          user_id,
-          identity_data,
-          provider,
-          provider_id,
-          last_sign_in_at,
-          created_at,
-          updated_at
-        FROM auth.identities
-        ORDER BY created_at
-      `);
-
-      logger.info(`Exported ${result.rows.length} identities`);
-      return result.rows;
-    } finally {
-      client.release();
-    }
+  async exportIdentities(columns?: string[]): Promise<AuthRow[]> {
+    const selectedColumns = columns ?? await this.getInsertableColumns(this.sourcePool, 'identities');
+    return this.exportAuthRows('identities', selectedColumns, 'identities');
   }
 
   /**
@@ -85,122 +186,95 @@ export class AuthSync {
     logger.info('Target auth data cleared');
   }
 
-  /**
-   * Import a batch of users via SQL using a provided client connection.
-   * Uses multi-row INSERT syntax for better performance.
-   * This ensures the operation uses the same connection where
-   * session_replication_role = replica has been set.
-   */
-  private async importUsersBatch(users: AuthUser[], client: pg.PoolClient): Promise<void> {
-    if (users.length === 0) return;
+  private async importRowsBatch(
+    tableName: string,
+    rows: AuthRow[],
+    columns: string[],
+    conflictColumn: string,
+    client: pg.PoolClient
+  ): Promise<void> {
+    if (rows.length === 0) return;
 
-    // Build multi-row VALUES clause
     const values: unknown[] = [];
-    const valuePlaceholders: string[] = [];
-    const columnsPerRow = 15; // Number of user columns (excluding the 3 fixed ones)
-
-    for (let i = 0; i < users.length; i++) {
-      const user = users[i];
-      const offset = i * columnsPerRow;
-      valuePlaceholders.push(
-        `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, ` +
-        `$${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8}, ` +
-        `$${offset + 9}, $${offset + 10}, $${offset + 11}, $${offset + 12}, ` +
-        `$${offset + 13}, $${offset + 14}, $${offset + 15}, ` +
-        `'00000000-0000-0000-0000-000000000000', 'authenticated', 'authenticated')`
-      );
-      values.push(
-        user.id,
-        user.email,
-        user.phone,
-        user.encrypted_password,
-        user.email_confirmed_at,
-        user.phone_confirmed_at,
-        JSON.stringify(user.raw_user_meta_data),
-        JSON.stringify(user.raw_app_meta_data),
-        user.created_at,
-        user.updated_at,
-        user.banned_until,
-        user.confirmation_token,
-        user.recovery_token,
-        user.email_change_token_new,
-        user.email_change
-      );
-    }
+    const valuePlaceholders = rows.map(row => {
+      const placeholders = columns.map(column => {
+        values.push(row[column] ?? null);
+        return `$${values.length}`;
+      });
+      return `(${placeholders.join(', ')})`;
+    });
+    const quotedColumns = columns.map(column => this.quoteIdentifier(column)).join(', ');
+    const quotedConflictColumn = this.quoteIdentifier(conflictColumn);
+    const updateColumns = columns.filter(column => column !== conflictColumn);
+    const conflictAction = updateColumns.length > 0
+      ? `DO UPDATE SET ${updateColumns
+        .map(column => `${this.quoteIdentifier(column)} = EXCLUDED.${this.quoteIdentifier(column)}`)
+        .join(', ')}`
+      : 'DO NOTHING';
 
     await client.query(`
-      INSERT INTO auth.users (
-        id, email, phone, encrypted_password,
-        email_confirmed_at, phone_confirmed_at,
-        raw_user_meta_data, raw_app_meta_data,
-        created_at, updated_at, banned_until,
-        confirmation_token, recovery_token,
-        email_change_token_new, email_change,
-        instance_id, aud, role
-      ) VALUES ${valuePlaceholders.join(', ')}
-      ON CONFLICT (id) DO UPDATE SET
-        email = EXCLUDED.email,
-        phone = EXCLUDED.phone,
-        encrypted_password = EXCLUDED.encrypted_password,
-        email_confirmed_at = EXCLUDED.email_confirmed_at,
-        phone_confirmed_at = EXCLUDED.phone_confirmed_at,
-        raw_user_meta_data = EXCLUDED.raw_user_meta_data,
-        raw_app_meta_data = EXCLUDED.raw_app_meta_data,
-        updated_at = EXCLUDED.updated_at,
-        banned_until = EXCLUDED.banned_until
+      INSERT INTO auth.${this.quoteIdentifier(tableName)} (${quotedColumns})
+      VALUES ${valuePlaceholders.join(', ')}
+      ON CONFLICT (${quotedConflictColumn}) ${conflictAction}
     `, values);
   }
 
-  /**
-   * Import a batch of identities using a provided client connection.
-   * Uses multi-row INSERT syntax for better performance.
-   * This ensures the operation uses the same connection where
-   * session_replication_role = replica has been set.
-   */
-  private async importIdentitiesBatch(identities: AuthIdentity[], client: pg.PoolClient): Promise<void> {
-    if (identities.length === 0) return;
+  private async importUsersBatch(
+    users: AuthRow[],
+    columns: string[],
+    client: pg.PoolClient
+  ): Promise<void> {
+    await this.importRowsBatch('users', users, columns, 'id', client);
+  }
 
-    // Build multi-row VALUES clause
-    const values: unknown[] = [];
-    const valuePlaceholders: string[] = [];
-    const columnsPerRow = 8;
+  private async importIdentitiesBatch(
+    identities: AuthRow[],
+    columns: string[],
+    client: pg.PoolClient
+  ): Promise<void> {
+    await this.importRowsBatch('identities', identities, columns, 'id', client);
+  }
 
-    for (let i = 0; i < identities.length; i++) {
-      const identity = identities[i];
-      const offset = i * columnsPerRow;
-      valuePlaceholders.push(
-        `($${offset + 1}, $${offset + 2}, $${offset + 3}, $${offset + 4}, ` +
-        `$${offset + 5}, $${offset + 6}, $${offset + 7}, $${offset + 8})`
-      );
-      values.push(
-        identity.id,
-        identity.user_id,
-        JSON.stringify(identity.identity_data),
-        identity.provider,
-        identity.provider_id,
-        identity.last_sign_in_at,
-        identity.created_at,
-        identity.updated_at
-      );
+  private async runWithSavepoint(
+    client: pg.PoolClient,
+    savepoint: string,
+    fn: () => Promise<void>
+  ): Promise<void> {
+    await client.query(`SAVEPOINT ${savepoint}`);
+    try {
+      await fn();
+      await client.query(`RELEASE SAVEPOINT ${savepoint}`);
+    } catch (error) {
+      await client.query(`ROLLBACK TO SAVEPOINT ${savepoint}`);
+      await client.query(`RELEASE SAVEPOINT ${savepoint}`);
+      throw error;
     }
+  }
 
-    await client.query(`
-      INSERT INTO auth.identities (
-        id, user_id, identity_data, provider, provider_id,
-        last_sign_in_at, created_at, updated_at
-      ) VALUES ${valuePlaceholders.join(', ')}
-      ON CONFLICT (id) DO UPDATE SET
-        identity_data = EXCLUDED.identity_data,
-        last_sign_in_at = EXCLUDED.last_sign_in_at,
-        updated_at = EXCLUDED.updated_at
-    `, values);
+  private sanitizedDatabaseError(error: unknown): string {
+    const pgError = error as { code?: string; constraint?: string };
+    if (!pgError.code) return 'database rejected row';
+
+    return `Postgres error ${pgError.code}${pgError.constraint ? ` (${pgError.constraint})` : ''}`;
   }
 
   async sync(): Promise<AuthSyncResult> {
+    const userColumns = await this.getCommonColumns('users');
+    const identityMapping = this.config.options.auth.migrateIdentities
+      ? await this.getIdentityColumnMapping()
+      : null;
+
+    logger.info(`Auth users sync will copy ${userColumns.length} common columns`);
+    if (identityMapping) {
+      logger.info(`Auth identities sync will copy ${identityMapping.importColumns.length} target columns`);
+    }
+
     if (this.config.dryRun) {
       logger.info('[DRY RUN] Would export and import auth users');
-      const users = await this.exportUsers();
-      const identities = await this.exportIdentities();
+      const users = await this.exportUsers(userColumns);
+      const identities = identityMapping
+        ? await this.exportIdentities(identityMapping.exportColumns)
+        : [];
       return {
         usersImported: users.length,
         identitiesImported: identities.length,
@@ -211,9 +285,12 @@ export class AuthSync {
     const errors: string[] = [];
 
     // Export from source (can use separate connections - read-only)
-    const users = await this.exportUsers();
-    const identities = this.config.options.auth.migrateIdentities
-      ? await this.exportIdentities()
+    const users = await this.exportUsers(userColumns);
+    const identities = identityMapping
+      ? this.mapIdentityRows(
+        await this.exportIdentities(identityMapping.exportColumns),
+        identityMapping
+      )
       : [];
 
     // Acquire a SINGLE connection for ALL import operations
@@ -221,12 +298,15 @@ export class AuthSync {
     const client = await this.targetPool.connect();
     let usersImported = 0;
     let identitiesImported = 0;
+    let transactionStarted = false;
 
     try {
       // Disable triggers/constraints on THIS connection
       // This setting is session-specific and will persist for all operations on this connection
       logger.info('Disabling triggers for auth import...');
       await client.query('SET session_replication_role = replica;');
+      await client.query('BEGIN');
+      transactionStarted = true;
 
       // Clear target using the same connection
       await this.clearTargetAuth(client);
@@ -235,20 +315,25 @@ export class AuthSync {
       logger.info(`Importing ${users.length} users in batches of ${BATCH_SIZE}...`);
       for (let i = 0; i < users.length; i += BATCH_SIZE) {
         const batch = users.slice(i, i + BATCH_SIZE);
+        const batchNum = Math.floor(i / BATCH_SIZE) + 1;
         try {
-          await this.importUsersBatch(batch, client);
+          await this.runWithSavepoint(client, `auth_users_batch_${batchNum}`, async () => {
+            await this.importUsersBatch(batch, userColumns, client);
+          });
           usersImported += batch.length;
-          logger.debug(`Imported users batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(users.length / BATCH_SIZE)} (${batch.length} users)`);
+          logger.debug(`Imported users batch ${batchNum}/${Math.ceil(users.length / BATCH_SIZE)} (${batch.length} users)`);
         } catch (error) {
           // Batch failed — retry records individually to save valid ones
-          const batchNum = Math.floor(i / BATCH_SIZE) + 1;
           logger.warn(`User batch ${batchNum} failed, retrying ${batch.length} users individually...`);
-          for (const user of batch) {
+          for (let j = 0; j < batch.length; j++) {
+            const user = batch[j];
             try {
-              await this.importUsersBatch([user], client);
+              await this.runWithSavepoint(client, `auth_user_${batchNum}_${j + 1}`, async () => {
+                await this.importUsersBatch([user], userColumns, client);
+              });
               usersImported++;
             } catch (individualError) {
-              const msg = `Failed to import user ${user.id}: ${(individualError as Error).message}`;
+              const msg = `Failed to import user at source row ${i + j + 1}: ${this.sanitizedDatabaseError(individualError)}`;
               logger.warn(msg);
               errors.push(msg);
             }
@@ -257,24 +342,29 @@ export class AuthSync {
       }
 
       // Import identities in batches using the same connection
-      if (identities.length > 0) {
+      if (identityMapping && identities.length > 0) {
         logger.info(`Importing ${identities.length} identities in batches of ${BATCH_SIZE}...`);
         for (let i = 0; i < identities.length; i += BATCH_SIZE) {
           const batch = identities.slice(i, i + BATCH_SIZE);
+          const batchNum = Math.floor(i / BATCH_SIZE) + 1;
           try {
-            await this.importIdentitiesBatch(batch, client);
+            await this.runWithSavepoint(client, `auth_identities_batch_${batchNum}`, async () => {
+              await this.importIdentitiesBatch(batch, identityMapping.importColumns, client);
+            });
             identitiesImported += batch.length;
-            logger.debug(`Imported identities batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(identities.length / BATCH_SIZE)} (${batch.length} identities)`);
+            logger.debug(`Imported identities batch ${batchNum}/${Math.ceil(identities.length / BATCH_SIZE)} (${batch.length} identities)`);
           } catch (error) {
             // Batch failed — retry records individually to save valid ones
-            const batchNum = Math.floor(i / BATCH_SIZE) + 1;
             logger.warn(`Identity batch ${batchNum} failed, retrying ${batch.length} identities individually...`);
-            for (const identity of batch) {
+            for (let j = 0; j < batch.length; j++) {
+              const identity = batch[j];
               try {
-                await this.importIdentitiesBatch([identity], client);
+                await this.runWithSavepoint(client, `auth_identity_${batchNum}_${j + 1}`, async () => {
+                  await this.importIdentitiesBatch([identity], identityMapping.importColumns, client);
+                });
                 identitiesImported++;
               } catch (individualError) {
-                const msg = `Failed to import identity ${identity.id}: ${(individualError as Error).message}`;
+                const msg = `Failed to import identity at source row ${i + j + 1}: ${this.sanitizedDatabaseError(individualError)}`;
                 logger.warn(msg);
                 errors.push(msg);
               }
@@ -284,6 +374,26 @@ export class AuthSync {
       }
 
       logger.info(`Auth sync complete: ${usersImported}/${users.length} users, ${identitiesImported}/${identities.length} identities`);
+      if (errors.length > 0) {
+        throw new SyncError(
+          `Auth sync failed: ${errors.length} row(s) failed to import: ${errors.slice(0, 3).join('; ')}${errors.length > 3 ? '; ...' : ''}`,
+          ErrorCategory.IMPORT,
+          'auth-sync',
+          false
+        );
+      }
+
+      await client.query('COMMIT');
+      transactionStarted = false;
+    } catch (error) {
+      if (transactionStarted) {
+        try {
+          await client.query('ROLLBACK');
+        } catch (rollbackError) {
+          logger.warn(`Failed to roll back auth import transaction: ${(rollbackError as Error).message}`);
+        }
+      }
+      throw error;
     } finally {
       // Re-enable triggers/constraints before releasing the connection
       let resetSucceeded = false;

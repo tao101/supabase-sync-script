@@ -69,7 +69,7 @@ export function loadOptionsFromEnv(): Partial<Config['options']> {
       excludeBuckets: getEnvVar('STORAGE_EXCLUDE_BUCKETS')?.split(',').filter(Boolean) || [],
     },
     database: {
-      includeSchemas: getEnvVar('DB_INCLUDE_SCHEMAS')?.split(',').filter(Boolean) || ['public', 'auth', 'storage'],
+      includeSchemas: getEnvVar('DB_INCLUDE_SCHEMAS')?.split(',').filter(Boolean) || ['public'],
       excludeTables: getEnvVar('DB_EXCLUDE_TABLES')?.split(',').filter(Boolean) || [],
       excludeSchemas: getEnvVar('DB_EXCLUDE_SCHEMAS')?.split(',').filter(Boolean) || ['pg_catalog', 'information_schema', 'pg_toast'],
     },

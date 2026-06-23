@@ -25,8 +25,8 @@
       "roles": true
     },
     "database": {
-      "includeSchemas": ["public", "auth", "storage"],
-      "excludeTables": ["auth.sessions", "auth.refresh_tokens"]
+      "includeSchemas": ["public"],
+      "excludeTables": []
     },
     "storage": {
       "concurrency": 5,

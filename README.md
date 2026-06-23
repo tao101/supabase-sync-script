@@ -175,8 +175,8 @@ npx supabase-sync test-connection --config ./config.json
       "roles": true
     },
     "database": {
-      "includeSchemas": ["public", "auth", "storage"],
-      "excludeTables": ["auth.sessions", "auth.refresh_tokens"]
+      "includeSchemas": ["public"],
+      "excludeTables": []
     },
     "storage": {
       "concurrency": 5,
@@ -283,7 +283,9 @@ Run `supabase status` to see connection details.
 
 ### Destructive Operation
 
-This tool performs a **full replacement** of data on the target. All existing data in the synced schemas will be **deleted and replaced**.
+This tool performs a **full replacement** of data on the target. All existing data in the synced application schemas will be **deleted and replaced**.
+
+Raw database schema/data sync is intended for application schemas such as `public`. Supabase-managed `auth` and `storage` schemas are skipped by database dumps and handled by the dedicated auth and storage sync steps.
 
 ### Auth Users
 
