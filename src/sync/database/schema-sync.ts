@@ -61,6 +61,10 @@ export class SchemaSync {
       '-f', dumpFile,
     ];
 
+    if (!this.config.options.components.roles) {
+      args.push('--no-privileges');
+    }
+
     const schemas = getApplicationSchemas(this.config);
     if (schemas.length === 0) {
       throw new SyncError(
@@ -272,8 +276,8 @@ export class SchemaSync {
         )
         SELECT dependent_object, referenced_object
         FROM dependency_schemas
-        WHERE dependent_schema IS NOT NULL
-          AND dependent_schema <> ALL($1::text[])
+        WHERE dependent_schema IS NULL
+          OR dependent_schema <> ALL($1::text[])
         ORDER BY dependent_object, referenced_object
         LIMIT 10
       `, [schemas, managedSchemas]);
@@ -547,6 +551,12 @@ export class SchemaSync {
       // Remove problematic Supabase-specific objects
       .replace(/CREATE POLICY [^;]+ ON "auth"\."[^"]+" [^;]+;/gi, '')
       .replace(/CREATE POLICY [^;]+ ON "storage"\."[^"]+" [^;]+;/gi, '');
+
+    if (!this.config.options.components.roles) {
+      processed = processed
+        .replace(/^\s*GRANT\b[^;]+;\s*$/gim, '')
+        .replace(/^\s*REVOKE\b[^;]+;\s*$/gim, '');
+    }
 
     const processedFile = await this.tempFileManager.createFile('schema_processed', '.sql');
     await this.tempFileManager.writeFile(processedFile, processed);
