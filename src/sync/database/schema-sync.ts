@@ -6,7 +6,7 @@ import { TempFileManager } from '../../utils/temp-files.js';
 import { logger } from '../../utils/logger.js';
 import { SyncError, ErrorCategory } from '../../types/sync.js';
 import type { PostgresPool } from '../../clients/postgres-client.js';
-import { getApplicationSchemas, quoteIdentifier, stripUnsupportedDumpSettings } from './schemas.js';
+import { getApplicationSchemas, getManagedSchemas, quoteIdentifier, stripUnsupportedDumpSettings } from './schemas.js';
 
 interface SchemaGrant {
   grantee: string;
@@ -160,6 +160,7 @@ export class SchemaSync {
   async resetTargetSchemas(): Promise<PreservedTrigger[]> {
     const schemas = getApplicationSchemas(this.config);
     if (schemas.length === 0) return [];
+    const managedSchemas = getManagedSchemas();
 
     logger.info(`Resetting target application schemas: ${schemas.join(', ')}`);
 
@@ -227,7 +228,7 @@ export class SchemaSync {
                 JOIN pg_class trigger_rel ON trigger_rel.oid = trigger_obj.tgrelid
                 JOIN pg_namespace trigger_ns ON trigger_ns.oid = trigger_rel.relnamespace
                 WHERE trigger_obj.oid = d.objid
-                  AND trigger_ns.nspname <> ALL($1::text[])
+                  AND trigger_ns.nspname = ANY($2::text[])
                   AND NOT trigger_obj.tgisinternal
               )
             )
@@ -276,7 +277,7 @@ export class SchemaSync {
           AND dependent_schema <> ALL($1::text[])
         ORDER BY dependent_object, referenced_object
         LIMIT 10
-      `, [schemas]);
+      `, [schemas, managedSchemas]);
 
       if (dependenciesResult.rows.length > 0) {
         const examples = dependenciesResult.rows
@@ -327,6 +328,7 @@ export class SchemaSync {
     client: pg.PoolClient,
     schemas: string[]
   ): Promise<PreservedTrigger[]> {
+    const managedSchemas = getManagedSchemas();
     const result = await client.query(`
       WITH app_objects AS (
         SELECT 'pg_class'::regclass::oid AS classid, c.oid AS objid
@@ -356,10 +358,10 @@ export class SchemaSync {
       JOIN pg_class trigger_rel ON trigger_rel.oid = trigger_obj.tgrelid
       JOIN pg_namespace trigger_ns ON trigger_ns.oid = trigger_rel.relnamespace
       WHERE d.deptype IN ('n', 'a')
-        AND trigger_ns.nspname <> ALL($1::text[])
+        AND trigger_ns.nspname = ANY($2::text[])
         AND NOT trigger_obj.tgisinternal
       ORDER BY trigger_ns.nspname, trigger_rel.relname, trigger_obj.tgname
-    `, [schemas]);
+    `, [schemas, managedSchemas]);
 
     return result.rows.map(row => ({
       schemaName: row.schema_name,

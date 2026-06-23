@@ -18,6 +18,10 @@ export function getApplicationSchemas(config: Config): string[] {
   return config.options.database.includeSchemas.filter(schema => !MANAGED_SCHEMAS.has(schema.toLowerCase()));
 }
 
+export function getManagedSchemas(): string[] {
+  return [...MANAGED_SCHEMAS];
+}
+
 export function quoteIdentifier(identifier: string): string {
   return `"${identifier.replace(/"/g, '""')}"`;
 }
