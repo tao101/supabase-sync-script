@@ -11,17 +11,6 @@ import { SyncError, ErrorCategory } from '../../types/sync.js';
 import type { PostgresPool } from '../../clients/postgres-client.js';
 import { getApplicationSchemas, quoteIdentifier } from './schemas.js';
 
-/**
- * System tables that should be excluded from data sync operations.
- * These tables are managed by Supabase or contain system metadata.
- */
-const EXCLUDED_SYSTEM_TABLES = [
-  'schema_migrations',
-  'migrations',
-  'buckets_vectors',
-  'vector_indexes',
-] as const;
-
 // Supabase internal auth tables that are version-dependent and should not be
 // synced via pg_dump. Auth users and identities are handled by AuthSync.
 const EXCLUDED_AUTH_SYSTEM_TABLES = [
@@ -104,10 +93,6 @@ export class DataSync {
       args.push(`--exclude-table=${table}`);
     }
 
-    for (const table of EXCLUDED_SYSTEM_TABLES) {
-      args.push(`--exclude-table=*.${table}`);
-    }
-
     // Exclude Supabase system tables (auth internals + storage tables managed by API)
     for (const table of ALL_EXCLUDED_SYSTEM_TABLES) {
       args.push(`--exclude-table=${table}`);
@@ -138,9 +123,8 @@ export class DataSync {
         SELECT schemaname, tablename
         FROM pg_tables
         WHERE schemaname = ANY($1)
-        AND tablename NOT IN (${EXCLUDED_SYSTEM_TABLES.map((_, i) => `$${i + 2}`).join(', ')})
         ORDER BY schemaname, tablename
-      `, [getApplicationSchemas(this.config), ...EXCLUDED_SYSTEM_TABLES]);
+      `, [getApplicationSchemas(this.config)]);
 
       const tables = tablesResult.rows.filter(row => {
         const tableName = `${row.schemaname}.${row.tablename}`;
@@ -232,9 +216,8 @@ export class DataSync {
         SELECT schemaname, tablename
         FROM pg_tables
         WHERE schemaname = ANY($1)
-        AND tablename NOT IN (${EXCLUDED_SYSTEM_TABLES.map((_, i) => `$${i + 2}`).join(', ')})
         ORDER BY schemaname, tablename
-      `, [getApplicationSchemas(this.config), ...EXCLUDED_SYSTEM_TABLES]);
+      `, [getApplicationSchemas(this.config)]);
 
       // Filter tables to verify
       const tablesToVerify = tablesResult.rows.filter(row => {
