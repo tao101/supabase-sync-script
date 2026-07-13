@@ -10,7 +10,7 @@ import {
   confirmDestructiveOperation,
   createSpinner,
 } from './modes/interactive-mode.js';
-import { loadCIConfig, printCISummary, logCIConnectionTest, printCIValidationResult } from './modes/ci-mode.js';
+import { printCISummary, logCIConnectionTest, printCIValidationResult } from './modes/ci-mode.js';
 import { logger, sanitizeErrorMessage, setLogLevel, print } from './utils/logger.js';
 import { resolveCIMode } from './config/env.js';
 import { testPostgresConnection, createPostgresPool } from './clients/postgres-client.js';
@@ -56,9 +56,10 @@ program
       const isCI = resolveCIMode(options.ci, config?.mode);
 
       if (isCI) {
-        config ??= await loadCIConfig({
+        config ??= await loadConfig({
           configPath: options.config,
           overrides: {
+            mode: 'ci',
             dryRun: options.dryRun,
             verbose: options.verbose,
           },

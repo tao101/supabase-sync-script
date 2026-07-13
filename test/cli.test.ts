@@ -38,3 +38,42 @@ test('CI prints a sanitized effective plan before connection attempts', async ()
     }
   );
 });
+
+test('CI applies skip flags before validating environment-only config', async () => {
+  const env = {
+    ...process.env,
+    CI: 'false',
+    GITHUB_ACTIONS: 'false',
+    SOURCE_DB_URL: 'postgresql://user@127.0.0.1:1/source',
+    TARGET_DB_URL: 'postgresql://user@127.0.0.1:1/target',
+    SYNC_SCHEMA: 'false',
+    SYNC_DATA: 'false',
+    SYNC_AUTH: 'true',
+    SYNC_STORAGE: 'true',
+    SYNC_ROLES: 'false',
+  };
+  for (const name of [
+    'SOURCE_API_URL',
+    'SOURCE_SERVICE_ROLE_KEY',
+    'SOURCE_SECRET_KEY',
+    'TARGET_API_URL',
+    'TARGET_SERVICE_ROLE_KEY',
+    'TARGET_SECRET_KEY',
+  ]) delete env[name];
+
+  await assert.rejects(
+    execFileAsync(tsx, ['src/cli.ts', 'sync', '--ci', '--dry-run', '--skip-storage'], {
+      cwd: projectRoot,
+      timeout: 10_000,
+      env,
+    }),
+    error => {
+      const failure = error as Error & { code: number; stdout: string; stderr: string };
+      const output = `${failure.stdout}\n${failure.stderr}`;
+      assert.equal(failure.code, 1);
+      assert.match(failure.stdout, /Components: auth/);
+      assert.doesNotMatch(output, /serviceRoleKey|secretKey|API URL is required/);
+      return true;
+    }
+  );
+});
