@@ -8,7 +8,7 @@ export const SupabaseConnectionSchema = z.object({
   // Database URL (primary connection method)
   dbUrl: z.string(),
   // Supabase API
-  apiUrl: z.string().url(),
+  apiUrl: z.string().url().optional().transform(value => value ?? ''),
   // Legacy keys (JWT format) - use either legacy OR new keys, not both
   serviceRoleKey: z.string().optional(),
   anonKey: z.string().optional(),
@@ -18,9 +18,9 @@ export const SupabaseConnectionSchema = z.object({
   // Legacy fields (optional, for backwards compatibility)
   projectRef: z.string().optional(),
   host: z.string().optional(),
-  port: z.number().default(5432),
+  port: z.number().int().positive().max(65535).default(5432),
   dbPassword: z.string().optional(),
-});
+}).strict();
 
 export type SupabaseConnection = z.infer<typeof SupabaseConnectionSchema>;
 
@@ -31,23 +31,23 @@ export const SyncOptionsSchema = z.object({
     auth: z.boolean().default(true),
     storage: z.boolean().default(true),
     roles: z.boolean().default(true),
-  }).default({}),
+  }).strict().default({}),
   database: z.object({
     excludeSchemas: z.array(z.string()).default(['pg_catalog', 'information_schema', 'pg_toast']),
     excludeTables: z.array(z.string()).default([]),
     includeSchemas: z.array(z.string()).default(['public']),
-  }).default({}),
+  }).strict().default({}),
   storage: z.object({
     excludeBuckets: z.array(z.string()).default([]),
-    maxFileSizeMB: z.number().default(50),
-    concurrency: z.number().default(5),
-  }).default({}),
+    maxFileSizeMB: z.number().finite().positive().default(50),
+    concurrency: z.number().int().positive().default(5),
+  }).strict().default({}),
   auth: z.object({
     preservePasswordHashes: z.boolean().default(true),
     migrateIdentities: z.boolean().default(true),
     skipSessions: z.boolean().default(true),
-  }).default({}),
-}).default({});
+  }).strict().default({}),
+}).strict().default({});
 
 export type SyncOptions = z.infer<typeof SyncOptionsSchema>;
 
@@ -59,6 +59,6 @@ export const ConfigSchema = z.object({
   dryRun: z.boolean().default(false),
   verbose: z.boolean().default(false),
   tempDir: z.string().default('/tmp/supabase-sync'),
-});
+}).strict();
 
 export type Config = z.infer<typeof ConfigSchema>;

@@ -6,6 +6,17 @@ import { AuthSyncResult, SyncError, ErrorCategory } from '../../types/sync.js';
 import type { PostgresPool } from '../../clients/postgres-client.js';
 
 const BATCH_SIZE = 500;
+const TARGET_AUTH_TABLES = [
+  'mfa_amr_claims',
+  'refresh_tokens',
+  'mfa_challenges',
+  'mfa_factors',
+  'one_time_tokens',
+  'flow_state',
+  'saml_relay_states',
+  'sessions',
+  'identities',
+];
 type AuthRow = Record<string, unknown>;
 
 interface IdentityColumnMapping {
@@ -16,6 +27,8 @@ interface IdentityColumnMapping {
 }
 
 export class AuthSync {
+  private sourceUserIds: string[] | null = null;
+
   constructor(
     private config: Config,
     private sourcePool: PostgresPool,
@@ -180,10 +193,147 @@ export class AuthSync {
    */
   private async clearTargetAuth(client: pg.PoolClient): Promise<void> {
     logger.info('Clearing existing auth data on target...');
-    // Clear in correct order due to foreign keys
-    await client.query('TRUNCATE auth.identities CASCADE');
-    await client.query('TRUNCATE auth.users CASCADE');
+    const result = await client.query(`
+      SELECT tables.table_name
+      FROM information_schema.tables AS tables
+      WHERE tables.table_schema = 'auth'
+        AND tables.table_type = 'BASE TABLE'
+        AND (
+          tables.table_name = ANY($1::text[])
+          OR EXISTS (
+            SELECT 1
+            FROM pg_constraint constraint_obj
+            JOIN pg_class relation_obj ON relation_obj.oid = constraint_obj.conrelid
+            JOIN pg_namespace relation_ns ON relation_ns.oid = relation_obj.relnamespace
+            WHERE constraint_obj.contype = 'f'
+              AND constraint_obj.confrelid = 'auth.users'::regclass
+              AND relation_ns.nspname = tables.table_schema
+              AND relation_obj.relname = tables.table_name
+          )
+        )
+      ORDER BY array_position($1::text[], tables.table_name), tables.table_name
+    `, [TARGET_AUTH_TABLES]);
+    for (const { table_name: table } of result.rows) {
+      if (table !== 'users') {
+        await client.query(`DELETE FROM auth.${this.quoteIdentifier(table)}`);
+      }
+    }
     logger.info('Target auth data cleared');
+  }
+
+  private async prepareTargetUsers(
+    users: AuthRow[],
+    commonColumns: string[],
+    client: pg.PoolClient
+  ): Promise<void> {
+    const sourceUserIds = users.map(user => String(user.id));
+    if (sourceUserIds.length === 0) return;
+
+    if (!this.config.options.auth.preservePasswordHashes && commonColumns.includes('encrypted_password')) {
+      await client.query(
+        'UPDATE auth.users SET encrypted_password = NULL WHERE id = ANY($1::uuid[])',
+        [sourceUserIds]
+      );
+    }
+
+    for (const column of ['email', 'phone'].filter(column => commonColumns.includes(column))) {
+      const sourceValues = [...new Set(users
+        .map(user => user[column])
+        .filter((value): value is string => typeof value === 'string'))];
+      if (sourceValues.length === 0) continue;
+
+      const identifier = this.quoteIdentifier(column);
+      await client.query(`
+        UPDATE auth.users
+        SET ${identifier} = NULL
+        WHERE NOT (id = ANY($1::uuid[]))
+          AND ${identifier} = ANY($2::text[])
+      `, [sourceUserIds, sourceValues]);
+    }
+  }
+
+  async cleanupTargetOnlyUsers(client?: pg.PoolClient): Promise<number> {
+    if (!this.sourceUserIds) throw new Error('Auth users must be exported before cleanup');
+
+    const ownClient = !client;
+    const dbClient = client ?? await this.targetPool.connect();
+    let transactionStarted = false;
+    try {
+      if (ownClient) {
+        await dbClient.query('BEGIN');
+        transactionStarted = true;
+      }
+
+      const references = await dbClient.query(`
+        SELECT
+          constraint_obj.conname AS constraint_name,
+          referencing_ns.nspname AS schema_name,
+          referencing_rel.relname AS table_name,
+          referencing_attr.attname AS column_name
+        FROM pg_constraint constraint_obj
+        JOIN pg_class referencing_rel ON referencing_rel.oid = constraint_obj.conrelid
+        JOIN pg_namespace referencing_ns ON referencing_ns.oid = referencing_rel.relnamespace
+        JOIN LATERAL generate_subscripts(constraint_obj.confkey, 1) key_index(position) ON true
+        JOIN pg_attribute referenced_attr
+          ON referenced_attr.attrelid = constraint_obj.confrelid
+          AND referenced_attr.attnum = constraint_obj.confkey[key_index.position]
+        JOIN pg_attribute referencing_attr
+          ON referencing_attr.attrelid = constraint_obj.conrelid
+          AND referencing_attr.attnum = constraint_obj.conkey[key_index.position]
+        WHERE constraint_obj.contype = 'f'
+          AND constraint_obj.confrelid = 'auth.users'::regclass
+          AND referenced_attr.attname = 'id'
+        ORDER BY referencing_ns.nspname, referencing_rel.relname, constraint_obj.conname
+      `);
+
+      const tables = new Map<string, { schema: string; table: string }>();
+      for (const reference of references.rows) {
+        tables.set(`${reference.schema_name}.${reference.table_name}`, {
+          schema: reference.schema_name,
+          table: reference.table_name,
+        });
+      }
+      for (const table of tables.values()) {
+        await dbClient.query(
+          `LOCK TABLE ${this.quoteIdentifier(table.schema)}.${this.quoteIdentifier(table.table)} IN SHARE MODE`
+        );
+      }
+
+      for (const reference of references.rows) {
+        const result = await dbClient.query(`
+          SELECT EXISTS (
+            SELECT 1
+            FROM ${this.quoteIdentifier(reference.schema_name)}.${this.quoteIdentifier(reference.table_name)}
+            WHERE ${this.quoteIdentifier(reference.column_name)} IS NOT NULL
+              AND NOT (${this.quoteIdentifier(reference.column_name)} = ANY($1::uuid[]))
+          ) AS has_target_only_reference
+        `, [this.sourceUserIds]);
+        if (result.rows[0]?.has_target_only_reference) {
+          throw new SyncError(
+            `Cannot remove target-only auth users because ${reference.schema_name}.${reference.table_name}.${reference.column_name} still references them`,
+            ErrorCategory.VALIDATION,
+            'auth-cleanup',
+            false
+          );
+        }
+      }
+
+      const result = await dbClient.query(
+        'DELETE FROM auth.users WHERE NOT (id = ANY($1::uuid[]))',
+        [this.sourceUserIds]
+      );
+      if (ownClient) {
+        await dbClient.query('COMMIT');
+        transactionStarted = false;
+      }
+      logger.info(`Removed ${result.rowCount ?? 0} target-only auth user(s)`);
+      return result.rowCount ?? 0;
+    } catch (error) {
+      if (transactionStarted) await dbClient.query('ROLLBACK').catch(() => {});
+      throw error;
+    } finally {
+      if (ownClient) dbClient.release();
+    }
   }
 
   private async importRowsBatch(
@@ -259,7 +409,10 @@ export class AuthSync {
   }
 
   async sync(): Promise<AuthSyncResult> {
-    const userColumns = await this.getCommonColumns('users');
+    const commonUserColumns = await this.getCommonColumns('users');
+    const userColumns = this.config.options.auth.preservePasswordHashes
+      ? commonUserColumns
+      : commonUserColumns.filter(column => column !== 'encrypted_password');
     const identityMapping = this.config.options.auth.migrateIdentities
       ? await this.getIdentityColumnMapping()
       : null;
@@ -286,6 +439,7 @@ export class AuthSync {
 
     // Export from source (can use separate connections - read-only)
     const users = await this.exportUsers(userColumns);
+    this.sourceUserIds = users.map(user => String(user.id));
     const identities = identityMapping
       ? this.mapIdentityRows(
         await this.exportIdentities(identityMapping.exportColumns),
@@ -310,6 +464,7 @@ export class AuthSync {
 
       // Clear target using the same connection
       await this.clearTargetAuth(client);
+      await this.prepareTargetUsers(users, commonUserColumns, client);
 
       // Import users in batches using the same connection
       logger.info(`Importing ${users.length} users in batches of ${BATCH_SIZE}...`);
@@ -373,7 +528,6 @@ export class AuthSync {
         }
       }
 
-      logger.info(`Auth sync complete: ${usersImported}/${users.length} users, ${identitiesImported}/${identities.length} identities`);
       if (errors.length > 0) {
         throw new SyncError(
           `Auth sync failed: ${errors.length} row(s) failed to import: ${errors.slice(0, 3).join('; ')}${errors.length > 3 ? '; ...' : ''}`,
@@ -383,8 +537,14 @@ export class AuthSync {
         );
       }
 
+      if (!this.config.options.components.data) {
+        await client.query('SET session_replication_role = DEFAULT;');
+        await this.cleanupTargetOnlyUsers(client);
+      }
+
       await client.query('COMMIT');
       transactionStarted = false;
+      logger.info(`Auth sync complete: ${usersImported}/${users.length} users, ${identitiesImported}/${identities.length} identities`);
     } catch (error) {
       if (transactionStarted) {
         try {

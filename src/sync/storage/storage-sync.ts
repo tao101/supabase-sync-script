@@ -1,10 +1,10 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
-import pLimit from 'p-limit';
 import type { Config } from '../../types/config.js';
 import type { PostgresPool } from '../../clients/postgres-client.js';
 import { logger } from '../../utils/logger.js';
 import { StorageSyncResult, BucketSyncResult, StorageBucket, StorageFile, SyncError, ErrorCategory } from '../../types/sync.js';
 import { withRetry } from '../../utils/retry.js';
+import { getApplicationSchemas, quoteIdentifier } from '../database/schemas.js';
 
 export class StorageSync {
   constructor(
@@ -81,7 +81,9 @@ export class StorageSync {
         if (item.id) {
           // It's a file
           // Extract size from metadata (Supabase storage returns size in metadata)
-          const size = (item.metadata as { size?: number })?.size ?? 0;
+          const metadata = item.metadata as { size?: unknown; contentLength?: unknown } | null;
+          const rawSize = metadata?.size ?? metadata?.contentLength;
+          const size = rawSize === undefined || rawSize === null ? Number.NaN : Number(rawSize);
           allFiles.push({
             name: fullPath,
             id: item.id,
@@ -136,15 +138,49 @@ export class StorageSync {
     );
   }
 
-  async syncBucket(bucket: StorageBucket): Promise<BucketSyncResult> {
+  private validateFileSizes(bucketName: string, files: StorageFile[]): void {
+    const maxBytes = this.config.options.storage.maxFileSizeMB * 1024 * 1024;
+    let invalidCount = 0;
+    let oversizedCount = 0;
+    const oversizedExamples: string[] = [];
+    for (const file of files) {
+      if (!Number.isFinite(file.size) || file.size < 0) {
+        invalidCount++;
+      } else if (file.size > maxBytes) {
+        oversizedCount++;
+        if (oversizedExamples.length < 3) oversizedExamples.push(file.name);
+      }
+    }
+
+    if (invalidCount > 0) {
+      throw new SyncError(
+        `${invalidCount} file(s) in bucket ${bucketName} have missing or invalid size metadata`,
+        ErrorCategory.STORAGE,
+        'storage-preflight',
+        false
+      );
+    }
+
+    if (oversizedCount > 0) {
+      throw new SyncError(
+        `${oversizedCount} file(s) in bucket ${bucketName} exceed storage.maxFileSizeMB (${this.config.options.storage.maxFileSizeMB} MB): ${oversizedExamples.join(', ')}`,
+        ErrorCategory.STORAGE,
+        'storage-preflight',
+        false
+      );
+    }
+  }
+
+  async syncBucket(bucket: StorageBucket, listedFiles?: StorageFile[]): Promise<BucketSyncResult> {
     logger.info(`Syncing bucket: ${bucket.name}`);
 
-    // Create bucket on target
-    await this.createBucket(bucket);
-
     // List all files
-    const files = await this.listAllFiles(bucket.name);
+    const files = listedFiles ?? await this.listAllFiles(bucket.name);
     logger.info(`Found ${files.length} files in bucket ${bucket.name}`);
+    this.validateFileSizes(bucket.name, files);
+
+    // Create the target bucket only after the source preflight succeeds.
+    await this.createBucket(bucket);
 
     if (files.length === 0) {
       logger.warn(
@@ -169,23 +205,25 @@ export class StorageSync {
       logger.info(`Bucket ${bucket.name}: ${largeFiles.length} large files (>=10MB), ${smallFiles.length} small files`);
     }
 
-    // Use a single limiter to ensure total concurrency never exceeds the configured limit.
-    // Process small files first, then large files, so large files don't block small ones.
-    const limit = pLimit(configuredConcurrency);
     const allFiles = [...smallFiles, ...largeFiles];
-
-    await Promise.allSettled(
-      allFiles.map(file => limit(async () => {
-        try {
-          await this.syncFile(bucket.name, file.name);
-          uploaded++;
-          logger.debug(`Synced file: ${bucket.name}/${file.name} (${(file.size / 1024 / 1024).toFixed(2)}MB)`);
-        } catch (error) {
-          failed++;
-          logger.warn(`Failed to sync file ${bucket.name}/${file.name}: ${(error as Error).message}`);
+    let nextFile = 0;
+    const workers = Array.from(
+      { length: Math.min(configuredConcurrency, allFiles.length) },
+      async () => {
+        while (nextFile < allFiles.length) {
+          const file = allFiles[nextFile++];
+          try {
+            await this.syncFile(bucket.name, file.name);
+            uploaded++;
+            logger.debug(`Synced file: ${bucket.name}/${file.name} (${(file.size / 1024 / 1024).toFixed(2)}MB)`);
+          } catch (error) {
+            failed++;
+            logger.warn(`Failed to sync file ${bucket.name}/${file.name}: ${(error as Error).message}`);
+          }
         }
-      }))
+      }
     );
+    await Promise.all(workers);
 
     logger.info(`Bucket ${bucket.name}: ${uploaded} uploaded, ${failed} failed`);
 
@@ -198,30 +236,38 @@ export class StorageSync {
   }
 
   async sync(): Promise<StorageSyncResult> {
-    if (this.config.dryRun) {
-      logger.info('[DRY RUN] Would sync storage buckets and files');
-      const buckets = await this.listBuckets();
-
-      const results: BucketSyncResult[] = [];
-      for (const bucket of buckets) {
-        const files = await this.listAllFiles(bucket.name);
-        results.push({
+    const buckets = await this.listBuckets();
+    const plans: { bucket: StorageBucket; total: number }[] = [];
+    const dryRunBuckets: BucketSyncResult[] = [];
+    for (const bucket of buckets) {
+      const files = await this.listAllFiles(bucket.name);
+      this.validateFileSizes(bucket.name, files);
+      if (this.config.dryRun) {
+        dryRunBuckets.push({
           bucket: bucket.name,
           total: files.length,
           uploaded: 0,
           failed: 0,
         });
+      } else {
+        plans.push({ bucket, total: files.length });
       }
-
-      return { buckets: results };
     }
 
-    const buckets = await this.listBuckets();
+    if (this.config.dryRun) {
+      logger.info('[DRY RUN] Would sync storage buckets and files');
+      return { buckets: dryRunBuckets };
+    }
+
     const results: BucketSyncResult[] = [];
 
-    for (const bucket of buckets) {
+    for (const { bucket, total } of plans) {
       try {
-        const result = await this.syncBucket(bucket);
+        const files = await this.listAllFiles(bucket.name);
+        if (files.length !== total) {
+          logger.warn(`Bucket ${bucket.name} changed after preflight (${total} -> ${files.length} files); validating the new inventory`);
+        }
+        const result = await this.syncBucket(bucket, files);
         results.push(result);
       } catch (error) {
         logger.error(`Failed to sync bucket ${bucket.name}: ${(error as Error).message}`);
@@ -266,10 +312,18 @@ export class StorageSync {
 
     const sourceApiUrl = this.config.source.apiUrl;
     const targetApiUrl = this.config.target.apiUrl;
+    if (!sourceApiUrl || !targetApiUrl) {
+      throw new SyncError(
+        'Source and target API URLs are required to rewrite storage URLs',
+        ErrorCategory.VALIDATION,
+        'storage-url-rewrite',
+        false
+      );
+    }
 
     // Normalize URLs (remove trailing slashes)
-    const sourceUrl = sourceApiUrl.replace(/\/$/, '');
-    const targetUrl = targetApiUrl.replace(/\/$/, '');
+    const sourceUrl = `${sourceApiUrl.replace(/\/$/, '')}/storage/v1/object/public/`;
+    const targetUrl = `${targetApiUrl.replace(/\/$/, '')}/storage/v1/object/public/`;
 
     if (sourceUrl === targetUrl) {
       logger.info('Source and target URLs are the same, skipping URL rewrite');
@@ -277,7 +331,10 @@ export class StorageSync {
     }
 
     const client = await this.targetPool!.connect();
+    let transactionStarted = false;
     try {
+      await client.query('BEGIN');
+      transactionStarted = true;
       let totalUpdated = 0;
 
       // Update auth.users raw_user_meta_data avatar_url
@@ -286,10 +343,10 @@ export class StorageSync {
         SET raw_user_meta_data = jsonb_set(
           raw_user_meta_data,
           '{avatar_url}',
-          to_jsonb(replace(raw_user_meta_data->>'avatar_url', $1, $2))
+          to_jsonb($2 || substring(raw_user_meta_data->>'avatar_url' FROM char_length($1) + 1))
         )
-        WHERE raw_user_meta_data->>'avatar_url' LIKE $3
-      `, [sourceUrl, targetUrl, `${sourceUrl}%`]);
+        WHERE left(raw_user_meta_data->>'avatar_url', char_length($1)) = $1
+      `, [sourceUrl, targetUrl]);
 
       if (authResult.rowCount && authResult.rowCount > 0) {
         logger.info(`Updated ${authResult.rowCount} avatar URLs in auth.users`);
@@ -298,40 +355,48 @@ export class StorageSync {
 
       // Find and update text columns containing storage URLs in public schema
       const columnsResult = await client.query(`
-        SELECT table_name, column_name
-        FROM information_schema.columns
-        WHERE table_schema = 'public'
-        AND data_type IN ('text', 'character varying')
-        AND column_name LIKE '%url%'
-      `);
+        SELECT columns.table_schema, columns.table_name, columns.column_name
+        FROM information_schema.columns AS columns
+        JOIN information_schema.tables AS tables
+          ON tables.table_schema = columns.table_schema
+          AND tables.table_name = columns.table_name
+        WHERE columns.table_schema = ANY($1)
+        AND tables.table_type = 'BASE TABLE'
+        AND columns.is_updatable = 'YES'
+        AND columns.is_generated = 'NEVER'
+        AND columns.data_type IN ('text', 'character varying')
+        AND columns.column_name LIKE '%url%'
+      `, [getApplicationSchemas(this.config)]);
 
       for (const row of columnsResult.rows) {
-        // Validate table and column names to prevent SQL injection
-        // Only allow alphanumeric characters and underscores
-        const tableNameRegex = /^[a-zA-Z_][a-zA-Z0-9_]*$/;
-        if (!tableNameRegex.test(row.table_name) || !tableNameRegex.test(row.column_name)) {
-          logger.warn(`Skipping invalid table/column name: ${row.table_name}.${row.column_name}`);
-          continue;
-        }
-
         try {
-          // Use format() with %I for safe identifier quoting (PostgreSQL)
           const updateResult = await client.query(`
-            UPDATE public.${row.table_name}
-            SET ${row.column_name} = replace(${row.column_name}, $1, $2)
-            WHERE ${row.column_name} LIKE $3
-          `, [sourceUrl, targetUrl, `${sourceUrl}%`]);
+            UPDATE ${quoteIdentifier(row.table_schema)}.${quoteIdentifier(row.table_name)}
+            SET ${quoteIdentifier(row.column_name)} = $2 || substring(${quoteIdentifier(row.column_name)} FROM char_length($1) + 1)
+            WHERE left(${quoteIdentifier(row.column_name)}, char_length($1)) = $1
+          `, [sourceUrl, targetUrl]);
 
           if (updateResult.rowCount && updateResult.rowCount > 0) {
-            logger.info(`Updated ${updateResult.rowCount} URLs in public.${row.table_name}.${row.column_name}`);
+            logger.info(`Updated ${updateResult.rowCount} URLs in ${row.table_schema}.${row.table_name}.${row.column_name}`);
             totalUpdated += updateResult.rowCount;
           }
         } catch (error) {
-          logger.debug(`Could not update ${row.table_name}.${row.column_name}: ${(error as Error).message}`);
+          throw new SyncError(
+            `Could not rewrite storage URLs in ${row.table_schema}.${row.table_name}.${row.column_name}: ${(error as Error).message}`,
+            ErrorCategory.STORAGE,
+            'storage-url-rewrite',
+            false,
+            error as Error
+          );
         }
       }
 
+      await client.query('COMMIT');
+      transactionStarted = false;
       logger.info(`Total storage URLs rewritten: ${totalUpdated}`);
+    } catch (error) {
+      if (transactionStarted) await client.query('ROLLBACK').catch(() => {});
+      throw error;
     } finally {
       client.release();
     }

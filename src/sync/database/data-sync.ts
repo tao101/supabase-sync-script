@@ -3,25 +3,13 @@ import { once } from 'events';
 import { createReadStream, createWriteStream } from 'fs';
 import { createInterface } from 'readline';
 import { finished } from 'stream/promises';
-import pLimit from 'p-limit';
 import type { Config } from '../../types/config.js';
 import { ConnectionBuilder } from '../../config/connection-builder.js';
 import { TempFileManager } from '../../utils/temp-files.js';
 import { logger } from '../../utils/logger.js';
 import { SyncError, ErrorCategory } from '../../types/sync.js';
 import type { PostgresPool } from '../../clients/postgres-client.js';
-import { getApplicationSchemas } from './schemas.js';
-
-/**
- * System tables that should be excluded from data sync operations.
- * These tables are managed by Supabase or contain system metadata.
- */
-const EXCLUDED_SYSTEM_TABLES = [
-  'schema_migrations',
-  'migrations',
-  'buckets_vectors',
-  'vector_indexes',
-] as const;
+import { getApplicationSchemas, quoteIdentifier } from './schemas.js';
 
 // Supabase internal auth tables that are version-dependent and should not be
 // synced via pg_dump. Auth users and identities are handled by AuthSync.
@@ -66,6 +54,11 @@ export class DataSync {
     this.connectionBuilder = new ConnectionBuilder();
   }
 
+  private isExcludedTable(schema: string, table: string): boolean {
+    const exclusions = this.config.options.database.excludeTables;
+    return exclusions.includes(table) || exclusions.includes(`${schema}.${table}`);
+  }
+
   async exportData(): Promise<string> {
     logger.info('Exporting database data from source...');
 
@@ -107,7 +100,7 @@ export class DataSync {
 
     try {
       await execa('pg_dump', args, {
-        env: { ...process.env, PGPASSWORD: this.config.source.dbPassword },
+        env: this.connectionBuilder.buildPgEnv(this.config.source),
       });
 
       logger.info(`Data exported to ${dumpFile}`);
@@ -123,117 +116,78 @@ export class DataSync {
     }
   }
 
-  async clearTargetData(): Promise<void> {
-    logger.info('Clearing existing data on target...');
-
+  private async buildClearTargetSql(): Promise<string> {
     const client = await this.targetPool.connect();
     try {
-      // Get all tables in included schemas
       const tablesResult = await client.query(`
         SELECT schemaname, tablename
         FROM pg_tables
         WHERE schemaname = ANY($1)
-        AND tablename NOT IN (${EXCLUDED_SYSTEM_TABLES.map((_, i) => `$${i + 2}`).join(', ')})
         ORDER BY schemaname, tablename
-      `, [getApplicationSchemas(this.config), ...EXCLUDED_SYSTEM_TABLES]);
+      `, [getApplicationSchemas(this.config)]);
 
-      // Truncate in reverse dependency order (simplified approach)
-      await client.query('SET session_replication_role = replica;');
-
-      for (const row of tablesResult.rows) {
+      const tables = tablesResult.rows.filter(row => {
         const tableName = `${row.schemaname}.${row.tablename}`;
+        return !ALL_EXCLUDED_SYSTEM_TABLES.includes(tableName) &&
+          !this.isExcludedTable(row.schemaname, row.tablename);
+      });
 
-        // Skip system tables managed separately (auth internals, storage via API)
-        if (ALL_EXCLUDED_SYSTEM_TABLES.includes(tableName)) {
-          logger.debug(`Skipping truncation of ${tableName} (managed separately)`);
-          continue;
-        }
+      if (tables.length === 0) return '';
 
-        try {
-          await client.query(`TRUNCATE TABLE "${row.schemaname}"."${row.tablename}" CASCADE`);
-          logger.debug(`Truncated ${row.schemaname}.${row.tablename}`);
-        } catch (error) {
-          throw new SyncError(
-            `Failed to truncate table ${tableName}: ${(error as Error).message}`,
-            ErrorCategory.IMPORT,
-            'clear-target-data',
-            false,
-            error as Error
-          );
-        }
-      }
-
+      const tableList = tables
+        .map(row => `${quoteIdentifier(row.schemaname)}.${quoteIdentifier(row.tablename)}`)
+        .join(', ');
+      return `TRUNCATE TABLE ${tableList};`;
     } finally {
-      // Reset session state before returning connection to pool
-      try {
-        await client.query('SET session_replication_role = DEFAULT;');
-      } catch {
-        // Best-effort reset — connection will be discarded by pool if broken
-      }
       client.release();
     }
   }
 
-  async importData(dumpFile: string): Promise<void> {
+  async clearTargetData(): Promise<void> {
+    logger.info('Clearing existing data on target...');
+    const clearSql = await this.buildClearTargetSql();
+    if (!clearSql) return;
+
+    const client = await this.targetPool.connect();
+    try {
+      // Listing all included tables together satisfies their mutual foreign keys.
+      // RESTRICT (the default) prevents excluded dependent tables from being erased.
+      await client.query(clearSql.replace(/;$/, ''));
+    } catch (error) {
+      throw new SyncError(
+        `Failed to truncate target tables: ${(error as Error).message}`,
+        ErrorCategory.IMPORT,
+        'clear-target-data',
+        false,
+        error as Error
+      );
+    } finally {
+      client.release();
+    }
+  }
+
+  async importData(dumpFile: string, beforeImportSql: string = ''): Promise<void> {
     logger.info('Importing database data to target...');
 
     const targetDbUrl = this.connectionBuilder.buildDbUrl(this.config.target);
 
     try {
       const processedFile = await this.preprocessDumpFile(dumpFile);
-      // Use -c to set session_replication_role before importing
-      // This disables triggers and allows data import without constraint checks
-      const result = await execa('psql', [
+      const prelude = [
+        'SET LOCAL session_replication_role = replica;',
+        beforeImportSql,
+      ].filter(Boolean).join('\n');
+      await execa('psql', [
         targetDbUrl,
-        '-c', 'SET session_replication_role = replica;',
+        '-X',
+        '--single-transaction',
+        '-v', 'ON_ERROR_STOP=1',
+        '-c', prelude,
         '-f', processedFile,
       ], {
-        env: { ...process.env, PGPASSWORD: this.config.target.dbPassword },
-        reject: false, // Don't throw on non-zero exit
+        env: this.connectionBuilder.buildPgEnv(this.config.target),
       });
-
-      // Filter out expected errors from stderr
-      let criticalErrorLines: string[] = [];
-      if (result.stderr && result.stderr.trim()) {
-        criticalErrorLines = result.stderr.split('\n').filter(line => {
-          if (!line.includes('ERROR')) return false;
-          // Filter out expected errors for system tables
-          if (line.includes('must be owner of')) return false; // System tables owned by supabase_admin
-          if (line.includes('permission denied')) return false; // System table permissions
-          if (line.includes('current transaction is aborted')) return false; // Cascading from other errors
-          return true;
-        });
-        if (criticalErrorLines.length > 0) {
-          logger.warn(`Data import had ${criticalErrorLines.length} errors:`);
-          criticalErrorLines.slice(0, 10).forEach(line => logger.warn(`  ${line.trim()}`));
-          if (criticalErrorLines.length > 10) {
-            logger.warn(`  ... and ${criticalErrorLines.length - 10} more errors`);
-          }
-        }
-      }
-
-      // Throw error only if there are critical (non-expected) errors
-      if (criticalErrorLines.length > 0) {
-        const errorSummary = `${criticalErrorLines.length} critical error(s): ${criticalErrorLines[0]?.trim() || 'unknown error'}`;
-
-        if (result.stderr) {
-          logger.debug(`psql stderr: ${result.stderr.slice(0, 1000)}`);
-        }
-
-        throw new SyncError(
-          `Data import failed: ${errorSummary}`,
-          ErrorCategory.IMPORT,
-          'data-import',
-          false,
-          undefined
-        );
-      }
-
-      if (result.exitCode !== 0) {
-        logger.warn(`Data import completed with exit code ${result.exitCode} (some errors may be expected)`);
-      } else {
-        logger.info('Data imported successfully');
-      }
+      logger.info('Data imported successfully');
     } catch (error) {
       // Re-throw SyncErrors as-is
       if (error instanceof SyncError) {
@@ -262,55 +216,44 @@ export class DataSync {
         SELECT schemaname, tablename
         FROM pg_tables
         WHERE schemaname = ANY($1)
-        AND tablename NOT IN (${EXCLUDED_SYSTEM_TABLES.map((_, i) => `$${i + 2}`).join(', ')})
         ORDER BY schemaname, tablename
-      `, [getApplicationSchemas(this.config), ...EXCLUDED_SYSTEM_TABLES]);
+      `, [getApplicationSchemas(this.config)]);
 
       // Filter tables to verify
       const tablesToVerify = tablesResult.rows.filter(row => {
         const tableName = `${row.schemaname}.${row.tablename}`;
-        return !this.config.options.database.excludeTables.includes(tableName) &&
+        return !this.isExcludedTable(row.schemaname, row.tablename) &&
                !ALL_EXCLUDED_SYSTEM_TABLES.includes(tableName);
       });
 
-      // Use p-limit to run COUNT queries in parallel with concurrency limit of 5
-      const limit = pLimit(5);
-
-      const countResults = await Promise.all(
-        tablesToVerify.map(row =>
-          limit(async () => {
-            const tableName = `${row.schemaname}.${row.tablename}`;
-            try {
-              const [sourceCount, targetCount] = await Promise.all([
-                sourceClient.query(
-                  `SELECT COUNT(*) as count FROM "${row.schemaname}"."${row.tablename}"`
-                ),
-                targetClient.query(
-                  `SELECT COUNT(*) as count FROM "${row.schemaname}"."${row.tablename}"`
-                ),
-              ]);
-
-              const srcCount = parseInt(sourceCount.rows[0]?.count || '0', 10);
-              const tgtCount = parseInt(targetCount.rows[0]?.count || '0', 10);
-
-              return {
-                table: tableName,
-                source: srcCount,
-                target: tgtCount,
-                success: true,
-              };
-            } catch (error) {
-              logger.debug(`Could not verify ${tableName}: ${(error as Error).message}`);
-              return {
-                table: tableName,
-                source: 0,
-                target: 0,
-                success: false,
-              };
-            }
-          })
-        )
-      );
+      const countResults: Array<{
+        table: string;
+        source: number;
+        target: number;
+        success: boolean;
+      }> = [];
+      for (const row of tablesToVerify) {
+        const tableName = `${row.schemaname}.${row.tablename}`;
+        try {
+          const [sourceCount, targetCount] = await Promise.all([
+            sourceClient.query(
+              `SELECT COUNT(*) as count FROM ${quoteIdentifier(row.schemaname)}.${quoteIdentifier(row.tablename)}`
+            ),
+            targetClient.query(
+              `SELECT COUNT(*) as count FROM ${quoteIdentifier(row.schemaname)}.${quoteIdentifier(row.tablename)}`
+            ),
+          ]);
+          countResults.push({
+            table: tableName,
+            source: parseInt(sourceCount.rows[0]?.count || '0', 10),
+            target: parseInt(targetCount.rows[0]?.count || '0', 10),
+            success: true,
+          });
+        } catch (error) {
+          logger.debug(`Could not verify ${tableName}: ${(error as Error).message}`);
+          countResults.push({ table: tableName, source: 0, target: 0, success: false });
+        }
+      }
 
       // Check for failed count queries — if any failed, verification cannot be trusted
       const failures = countResults.filter(result => !result.success);
@@ -377,7 +320,8 @@ export class DataSync {
             WHERE a.attrelid = c.confrelid
               AND a.attnum = ANY(c.confkey)
             ORDER BY array_position(c.confkey, a.attnum)
-          ) AS parent_columns
+          ) AS parent_columns,
+          c.confmatchtype AS match_type
         FROM pg_constraint c
         JOIN pg_class child_rel ON c.conrelid = child_rel.oid
         JOIN pg_namespace child_ns ON child_rel.relnamespace = child_ns.oid
@@ -397,30 +341,33 @@ export class DataSync {
       let queryFailures = 0;
 
       for (const fk of fkResult.rows) {
-        const childTable = `"${fk.child_schema}"."${fk.child_table}"`;
-        const parentTable = `"${fk.parent_schema}"."${fk.parent_table}"`;
+        const childTable = `${quoteIdentifier(fk.child_schema)}.${quoteIdentifier(fk.child_table)}`;
+        const parentTable = `${quoteIdentifier(fk.parent_schema)}.${quoteIdentifier(fk.parent_table)}`;
         const childColumns: string[] = fk.child_columns;
         const parentColumns: string[] = fk.parent_columns;
 
         try {
           // Build composite column references for the orphan check
           const nullChecks = childColumns
-            .map(col => `c."${col}" IS NOT NULL`)
+            .map(col => `c.${quoteIdentifier(col)} IS NOT NULL`)
             .join(' AND ');
 
           const joinConditions = childColumns
-            .map((col, i) => `p."${parentColumns[i]}" = c."${col}"`)
+            .map((col, i) => `p.${quoteIdentifier(parentColumns[i])} = c.${quoteIdentifier(col)}`)
             .join(' AND ');
+          const partialNullCheck = fk.match_type === 'f'
+            ? ` OR ((${childColumns.map(col => `c.${quoteIdentifier(col)} IS NULL`).join(' OR ')}) AND (${childColumns.map(col => `c.${quoteIdentifier(col)} IS NOT NULL`).join(' OR ')}))`
+            : '';
 
           // Check for orphaned records: child records pointing to non-existent parent records
           const orphanResult = await client.query(`
             SELECT COUNT(*) as orphan_count
             FROM ${childTable} c
-            WHERE ${nullChecks}
+            WHERE (${nullChecks}
               AND NOT EXISTS (
                 SELECT 1 FROM ${parentTable} p
                 WHERE ${joinConditions}
-              )
+              ))${partialNullCheck}
           `);
 
           const orphanCount = parseInt(orphanResult.rows[0]?.orphan_count || '0', 10);
@@ -476,11 +423,9 @@ export class DataSync {
     // Export data from source
     const dumpFile = await this.exportData();
 
-    // Clear existing data and import new data
-    // Note: importData() uses psql -c to set session_replication_role = replica
-    // which disables triggers during the import
-    await this.clearTargetData();
-    await this.importData(dumpFile);
+    // Clear and import in one psql transaction so failures restore target data.
+    const clearSql = await this.buildClearTargetSql();
+    await this.importData(dumpFile, clearSql);
 
     // Verify data counts match between source and target
     const countsMatch = await this.verifyDataCounts(sourcePool);

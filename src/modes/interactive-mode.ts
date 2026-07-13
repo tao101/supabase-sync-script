@@ -1,9 +1,9 @@
 import inquirer from 'inquirer';
 import chalk from 'chalk';
 import ora from 'ora';
-import type { Config, SupabaseConnection } from '../types/config.js';
+import { ConfigSchema, type Config, type SupabaseConnection } from '../types/config.js';
 import { print } from '../utils/logger.js';
-import { createPostgresPool, testPostgresConnection, setSslPreference } from '../clients/postgres-client.js';
+import { createPostgresPool, testPostgresConnection } from '../clients/postgres-client.js';
 import { createSupabaseClient, testSupabaseConnection } from '../clients/supabase-client.js';
 import { isLegacyJwtKey, isNewSecretKey, isValidApiKey } from '../config/index.js';
 
@@ -18,7 +18,6 @@ async function testDatabaseUrl(dbUrl: string): Promise<boolean> {
   const spinner = ora('Testing database connection...').start();
 
   try {
-    // First try with SSL (for non-localhost)
     const pool = createPostgresPool({ dbUrl } as SupabaseConnection);
     const result = await testPostgresConnection(pool);
     await pool.end();
@@ -28,27 +27,10 @@ async function testDatabaseUrl(dbUrl: string): Promise<boolean> {
       return true;
     }
 
-    // If SSL error, retry without SSL
-    if (result.error && result.error.includes('SSL')) {
-      spinner.text = 'SSL not supported, retrying without SSL...';
-
-      // Remember this host doesn't support SSL
-      setSslPreference(dbUrl, false);
-
-      const poolNoSsl = createPostgresPool({ dbUrl } as SupabaseConnection, true);
-      const resultNoSsl = await testPostgresConnection(poolNoSsl);
-      await poolNoSsl.end();
-
-      if (resultNoSsl.success) {
-        spinner.succeed('Database connection successful (without SSL)');
-        return true;
-      } else {
-        spinner.fail(`Database connection failed: ${resultNoSsl.error || 'Unknown error'}`);
-        return false;
-      }
-    }
-
-    spinner.fail(`Database connection failed: ${result.error || 'Unknown error'}`);
+    const tlsHelp = result.error?.includes('SSL')
+      ? ' Remote databases require verified TLS; use sslmode=disable only for intentional plaintext.'
+      : '';
+    spinner.fail(`Database connection failed: ${result.error || 'Unknown error'}.${tlsHelp}`);
     return false;
   } catch (error) {
     spinner.fail(`Database connection failed: ${(error as Error).message}`);
@@ -74,7 +56,7 @@ async function testSupabaseApi(apiUrl: string, apiKey: string): Promise<boolean>
       connection.serviceRoleKey = apiKey;
     }
 
-    const client = createSupabaseClient(connection);
+    const client = createSupabaseClient(connection, 15_000);
     const success = await testSupabaseConnection(client);
 
     if (success) {
@@ -122,7 +104,7 @@ async function promptWithRetry<T>(
   throw new Error('Unexpected error in promptWithRetry');
 }
 
-export async function gatherSourceConfig(): Promise<SupabaseConnection> {
+export async function gatherSourceConfig(includeApi: boolean = true): Promise<SupabaseConnection> {
   print.header('Source Supabase Configuration');
 
   console.log(chalk.gray('Enter your source database connection details.\n'));
@@ -148,6 +130,9 @@ export async function gatherSourceConfig(): Promise<SupabaseConnection> {
     },
     testDatabaseUrl
   );
+
+  const connection = { dbUrl, port: 5432 } as SupabaseConnection;
+  if (!includeApi) return connection;
 
   // Get and test Supabase API
   const { apiUrl } = await inquirer.prompt([{
@@ -184,11 +169,7 @@ export async function gatherSourceConfig(): Promise<SupabaseConnection> {
   );
 
   // Return connection with appropriate key field based on format
-  const connection: SupabaseConnection = {
-    dbUrl,
-    apiUrl,
-    port: 5432,
-  } as SupabaseConnection;
+  connection.apiUrl = apiUrl;
 
   if (isNewSecretKey(apiKey)) {
     connection.secretKey = apiKey;
@@ -199,7 +180,7 @@ export async function gatherSourceConfig(): Promise<SupabaseConnection> {
   return connection;
 }
 
-export async function gatherTargetConfig(): Promise<SupabaseConnection> {
+export async function gatherTargetConfig(includeApi: boolean = true): Promise<SupabaseConnection> {
   print.header('Target Supabase Configuration');
 
   console.log(chalk.gray('Enter your target database connection details.\n'));
@@ -225,6 +206,9 @@ export async function gatherTargetConfig(): Promise<SupabaseConnection> {
     },
     testDatabaseUrl
   );
+
+  const connection = { dbUrl, port: 5432 } as SupabaseConnection;
+  if (!includeApi) return connection;
 
   // Get and test Supabase API
   const { apiUrl } = await inquirer.prompt([{
@@ -261,11 +245,7 @@ export async function gatherTargetConfig(): Promise<SupabaseConnection> {
   );
 
   // Return connection with appropriate key field based on format
-  const connection: SupabaseConnection = {
-    dbUrl,
-    apiUrl,
-    port: 5432,
-  } as SupabaseConnection;
+  connection.apiUrl = apiUrl;
 
   if (isNewSecretKey(apiKey)) {
     connection.secretKey = apiKey;
@@ -276,20 +256,26 @@ export async function gatherTargetConfig(): Promise<SupabaseConnection> {
   return connection;
 }
 
-export async function gatherSyncOptions(): Promise<Partial<Config['options']>> {
+type SkippedComponents = Partial<Record<keyof Config['options']['components'], boolean>>;
+
+export async function gatherSyncOptions(skipped: SkippedComponents = {}): Promise<Partial<Config['options']>> {
   print.header('Sync Options');
+  if (Object.values(skipped).filter(Boolean).length === 5) {
+    throw new Error('At least one sync component must remain enabled');
+  }
 
   const { components } = await inquirer.prompt([
     {
       type: 'checkbox',
       name: 'components',
       message: 'Select components to sync:',
+      validate: (selected: string[]) => selected.length > 0 || 'Select at least one component',
       choices: [
-        { name: 'Database Schema', value: 'schema', checked: true },
-        { name: 'Database Data', value: 'data', checked: true },
-        { name: 'Database Roles', value: 'roles', checked: true },
-        { name: 'Auth Users', value: 'auth', checked: true },
-        { name: 'Storage Buckets & Files', value: 'storage', checked: true },
+        { name: 'Database Schema', value: 'schema', checked: !skipped.schema, disabled: skipped.schema ? 'Skipped by command-line flag' : false },
+        { name: 'Database Data', value: 'data', checked: !skipped.data, disabled: skipped.data ? 'Skipped by command-line flag' : false },
+        { name: 'Database Roles', value: 'roles', checked: !skipped.roles, disabled: skipped.roles ? 'Skipped by command-line flag' : false },
+        { name: 'Auth Users', value: 'auth', checked: !skipped.auth, disabled: skipped.auth ? 'Skipped by command-line flag' : false },
+        { name: 'Storage Buckets & Files', value: 'storage', checked: !skipped.storage, disabled: skipped.storage ? 'Skipped by command-line flag' : false },
       ],
     },
   ]);
@@ -305,12 +291,24 @@ export async function gatherSyncOptions(): Promise<Partial<Config['options']>> {
   };
 }
 
-export async function confirmDestructiveOperation(targetDescription: string): Promise<boolean> {
+export async function confirmDestructiveOperation(
+  targetDescription: string,
+  config?: Config
+): Promise<boolean> {
+  const changes = config ? [
+    config.options.components.schema && `Replace application schemas: ${config.options.database.includeSchemas.join(', ')}`,
+    config.options.components.data && 'Replace rows in included application tables',
+    config.options.components.auth && 'Replace auth users/identities and clear existing login sessions',
+    config.options.components.storage && 'Upsert Storage buckets/files; target-only objects remain',
+    config.options.components.roles && 'Import custom database roles; existing name conflicts fail',
+  ].filter(Boolean) : ['Replace data in the selected target scopes'];
+
   console.log('\n');
-  console.log(chalk.red.bold('⚠️  WARNING: DESTRUCTIVE OPERATION'));
+  console.log(chalk.red.bold('⚠️  CONFIRM TARGET CHANGES'));
   console.log(chalk.red('─'.repeat(50)));
-  console.log(chalk.yellow(`This will REPLACE ALL DATA on the target:`));
+  console.log(chalk.yellow('This run will change the target:'));
   console.log(chalk.white.bold(`  ${targetDescription}`));
+  for (const change of changes) console.log(chalk.yellow(`  • ${change}`));
   console.log(chalk.red('─'.repeat(50)));
   console.log('\n');
 
@@ -337,43 +335,17 @@ export async function confirmDestructiveOperation(targetDescription: string): Pr
   return false;
 }
 
-export async function gatherFullConfig(): Promise<Config> {
-  const source = await gatherSourceConfig();
-  const target = await gatherTargetConfig();
-  const options = await gatherSyncOptions();
+export async function gatherFullConfig(skipped: SkippedComponents = {}): Promise<Config> {
+  const options = await gatherSyncOptions(skipped);
+  const includeApi = options.components?.storage ?? true;
+  const source = await gatherSourceConfig(includeApi);
+  const target = await gatherTargetConfig(includeApi);
 
-  return {
+  return ConfigSchema.parse({
     source,
     target,
-    options: {
-      components: options.components || {
-        schema: true,
-        data: true,
-        auth: true,
-        storage: true,
-        roles: true,
-      },
-      database: {
-        includeSchemas: ['public'],
-        excludeSchemas: ['pg_catalog', 'information_schema', 'pg_toast'],
-        excludeTables: [],
-      },
-      storage: {
-        excludeBuckets: [],
-        maxFileSizeMB: 50,
-        concurrency: 5,
-      },
-      auth: {
-        preservePasswordHashes: true,
-        migrateIdentities: true,
-        skipSessions: true,
-      },
-    },
-    mode: 'interactive',
-    dryRun: false,
-    verbose: false,
-    tempDir: '/tmp/supabase-sync',
-  };
+    options,
+  });
 }
 
 export function createSpinner(text: string): ReturnType<typeof ora> {

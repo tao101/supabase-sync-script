@@ -29,30 +29,39 @@ supabase-sync sync
 - **Database Schema Sync**: Tables, functions, triggers, RLS policies
 - **Database Data Sync**: Full data migration with COPY format for performance
 - **Sequence Reset**: Automatically resets sequences after import to prevent primary key conflicts
-- **Auth Users Sync**: Preserves password hashes so users can login with same credentials
+- **Auth Users Sync**: Preserves password hashes by default so users can log in with the same credentials
 - **Storage Sync**: Buckets and files with concurrent uploads
 - **Roles Sync**: Database roles (filters out built-in Supabase roles)
 - **Two Modes**: Interactive (guided prompts) and CI (automated)
-- **Dry Run**: Preview changes without applying them
+- **Dry Run**: Run connection checks and non-mutating preflight without target changes
 - **Connection Testing**: Validates database URLs immediately after input
 
 ## Prerequisites
 
 - **Node.js** >= 18
-- **PostgreSQL client tools** (`pg_dump`, `psql`) installed on your system
+- **PostgreSQL client tools** >= 16 (`pg_dump`, `pg_dumpall`, `psql`) installed on your system
 
 ### Installing PostgreSQL Client Tools
 
 ```bash
-# Ubuntu/Debian
-sudo apt-get install postgresql-client
+# Ubuntu/Debian (enable the official PGDG repository first if needed)
+sudo apt-get install postgresql-client-16
 
 # macOS
-brew install postgresql
+brew install libpq
+export PATH="$(brew --prefix libpq)/bin:$PATH"
 
 # Windows (via chocolatey)
 choco install postgresql
+
+# Verify every required tool is version 16 or newer
+psql --version
+pg_dump --version
+pg_dumpall --version
 ```
+
+See PostgreSQL's official [Linux download instructions](https://www.postgresql.org/download/linux/)
+if your distribution does not provide `postgresql-client-16` or a newer version.
 
 ## Usage
 
@@ -65,11 +74,11 @@ npx supabase-sync sync
 ```
 
 You'll be guided through:
-1. Entering source database URL (connection tested immediately)
-2. Entering source Supabase API URL and service role key
-3. Entering target database URL (connection tested immediately)
-4. Entering target Supabase API URL and service role key
-5. Choosing which components to sync
+1. Choosing which components to sync
+2. Entering source database URL (connection tested immediately)
+3. Entering source Supabase API credentials when storage sync is enabled
+4. Entering target database URL (connection tested immediately)
+5. Entering target Supabase API credentials when storage sync is enabled
 6. Confirming the operation
 
 ### CI Mode
@@ -80,11 +89,11 @@ For automated pipelines, use environment variables:
 # Set environment variables
 export SOURCE_DB_URL="postgresql://postgres:password@db.your-project.supabase.co:5432/postgres"
 export SOURCE_API_URL="https://your-project.supabase.co"
-export SOURCE_SERVICE_ROLE_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+export SOURCE_SERVICE_ROLE_KEY="header.payload.signature"
 
 export TARGET_DB_URL="postgresql://postgres:password@your-server.com:5432/postgres"
 export TARGET_API_URL="https://supabase.your-server.com"
-export TARGET_SERVICE_ROLE_KEY="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+export TARGET_SERVICE_ROLE_KEY="header.payload.signature"
 
 # Run in CI mode
 npx supabase-sync sync --ci
@@ -110,7 +119,7 @@ npx supabase-sync sync [options]
 |--------|-------------|
 | `-c, --config <path>` | Path to config file |
 | `--ci` | Run in CI mode (non-interactive) |
-| `--dry-run` | Preview changes without applying |
+| `--dry-run` | Run connection checks and read-only preflight without target changes |
 | `--verbose` | Enable debug logging |
 | `--skip-schema` | Skip database schema sync |
 | `--skip-data` | Skip database data sync |
@@ -124,7 +133,7 @@ npx supabase-sync sync [options]
 # Interactive sync
 npx supabase-sync sync
 
-# Dry run to preview changes
+# Run non-mutating connection checks and preflight
 npx supabase-sync sync --dry-run
 
 # Sync only database (skip auth and storage)
@@ -146,6 +155,9 @@ npx supabase-sync validate --config ./config.json
 
 Test connections to source and target.
 
+When roles, schema, or data sync is enabled, this also verifies the required
+PostgreSQL 16+ tools and their libpq connections.
+
 ```bash
 npx supabase-sync test-connection --config ./config.json
 ```
@@ -159,12 +171,12 @@ npx supabase-sync test-connection --config ./config.json
   "source": {
     "dbUrl": "postgresql://postgres:your-password@db.your-project.supabase.co:5432/postgres",
     "apiUrl": "https://your-project.supabase.co",
-    "serviceRoleKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+    "serviceRoleKey": "header.payload.signature"
   },
   "target": {
     "dbUrl": "postgresql://postgres:your-password@your-server.com:5432/postgres",
     "apiUrl": "https://supabase.your-server.com",
-    "serviceRoleKey": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+    "serviceRoleKey": "header.payload.signature"
   },
   "options": {
     "components": {
@@ -182,12 +194,27 @@ npx supabase-sync test-connection --config ./config.json
       "concurrency": 5,
       "maxFileSizeMB": 50,
       "excludeBuckets": ["temp-uploads"]
+    },
+    "auth": {
+      "preservePasswordHashes": true,
+      "migrateIdentities": true,
+      "skipSessions": true
     }
   },
   "dryRun": false,
   "verbose": false
 }
 ```
+
+All credentials in the example are placeholders and must be replaced. The example
+uses legacy JWT service-role keys. For Supabase's newer key format,
+replace each `serviceRoleKey` with `secretKey: "sb_secret_..."`. Do not configure
+both key formats on the same connection. API URLs and keys are optional when
+storage sync is disabled; auth migration uses the direct database connection.
+
+`database.excludeTables` preserves matching target table data and therefore
+requires schema sync to be disabled (for example, `--skip-schema`). A schema
+sync replaces the entire selected application schema.
 
 ### Environment Variables
 
@@ -201,12 +228,14 @@ SYNC_TEMP_DIR=/tmp/supabase-sync
 # Source Configuration
 SOURCE_DB_URL=postgresql://postgres:password@db.your-project.supabase.co:5432/postgres
 SOURCE_API_URL=https://your-project.supabase.co
-SOURCE_SERVICE_ROLE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+SOURCE_SERVICE_ROLE_KEY=header.payload.signature
+# Or: SOURCE_SECRET_KEY=sb_secret_...
 
 # Target Configuration
 TARGET_DB_URL=postgresql://postgres:password@your-server.com:5432/postgres
 TARGET_API_URL=https://supabase.your-server.com
-TARGET_SERVICE_ROLE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+TARGET_SERVICE_ROLE_KEY=header.payload.signature
+# Or: TARGET_SECRET_KEY=sb_secret_...
 
 # Component toggles
 SYNC_SCHEMA=true
@@ -219,15 +248,34 @@ SYNC_ROLES=true
 STORAGE_CONCURRENCY=5
 STORAGE_MAX_FILE_SIZE_MB=50
 # STORAGE_EXCLUDE_BUCKETS=temp,cache
+
+# Database selection
+DB_INCLUDE_SCHEMAS=public
+# DB_EXCLUDE_SCHEMAS=audit
+# DB_EXCLUDE_TABLES=public.large_archive
 ```
+
+Environment variables override config-file values only when they are set. Unknown
+config keys and invalid boolean or numeric values are rejected instead of silently
+falling back to destructive defaults.
 
 ## Database URL Format
 
 The database URL follows the PostgreSQL connection string format:
 
 ```
-postgresql://[user]:[password]@[host]:[port]/[database]
+postgresql://user[:password]@host[:port]/database
 ```
+
+`postgres://` is also accepted. User, host, and database must be explicit so the
+Node client and PostgreSQL tools cannot resolve different implicit endpoints.
+
+Remote connections default to certificate- and hostname-verified TLS
+(`sslmode=verify-full`) using the system trust store. This requires PostgreSQL 16+
+client tools; pass `sslrootcert=/path/to/ca.pem` for a private CA. Exact loopback
+hosts default to `sslmode=disable`. Only `verify-full` and `disable` are accepted.
+For a remote server that intentionally uses plaintext on a trusted network, opt in
+explicitly with `?sslmode=disable`; the CLI never downgrades TLS automatically.
 
 ### Examples
 
@@ -268,11 +316,11 @@ Run `supabase status` to see connection details.
    ↓
 3. Sync Schema (pg_dump → process → psql)
    ↓
-4. Sync Data (disable constraints → truncate → import → enable)
+4. Sync Auth Users (before application rows that reference `auth.users`)
    ↓
-5. Reset Sequences (prevents primary key conflicts)
+5. Sync Data (truncate + import in one transaction)
    ↓
-6. Sync Auth Users (preserves password hashes)
+6. Reset Sequences (prevents primary key conflicts)
    ↓
 7. Sync Storage (create buckets → upload files)
    ↓
@@ -283,27 +331,64 @@ Run `supabase status` to see connection details.
 
 ### Destructive Operation
 
-This tool performs a **full replacement** of data on the target. All existing data in the synced application schemas will be **deleted and replaced**.
+Database schema/data and auth sync are destructive for the selected scopes. Existing
+data in synced application schemas is deleted and replaced; Storage has the
+non-deleting upsert behavior described below.
 
-Raw database schema/data sync is intended for application schemas such as `public`. Supabase-managed `auth` and `storage` schemas are skipped by database dumps and handled by the dedicated auth and storage sync steps.
+Raw database schema/data sync is intended for application schemas such as `public`.
+Supabase-managed schemas are rejected in `includeSchemas`. `auth` and `storage` are
+handled by dedicated steps. `realtime`, `extensions`, `vault`, `graphql`,
+`graphql_public`, `net`, `pgsodium`, `supabase_functions`, and
+`supabase_migrations` are not migrated.
+
+Schema reset/import and data truncate/import are transactional: a SQL import
+failure rolls back the destructive target changes. Source and target endpoints
+with the same normalized host, port, and database—or the same Storage API—are
+rejected before execution. DNS aliases cannot be identified automatically; do not
+configure two different hostnames that reach the same database.
+
+Components commit independently. A failure in a later component does not roll back
+an earlier completed role, schema, auth, data, or Storage step.
 
 ### Auth Users
 
-- Password hashes are preserved - users can login with the same credentials
-- Sessions and refresh tokens are NOT synced (users need to login again)
-- OAuth identities are synced
+- Password hashes are preserved by default; set `preservePasswordHashes` to `false` to omit them
+- Sessions, refresh tokens, and other login state are cleared and not synced; `skipSessions` must remain `true`
+- OAuth identities are synced by default; set `migrateIdentities` to `false` to omit them
+
+Target-only users are removed only after application data sync succeeds. Auth-only
+sync refuses to remove a user while an application table still references it.
+
+### Roles
+
+Role import is strict. If a same-named custom role already exists on the target, the
+step fails; use `--skip-roles` for targets where roles are pre-provisioned.
 
 ### Foreign Key Constraints
 
 The sync handles foreign key constraints automatically:
-- Disables triggers during import
-- Defers constraint checking
-- Data is imported in dependency order
-- Constraints are re-enabled after import
+- Disables ordinary triggers, including foreign-key enforcement, only in the import transaction
+- Truncates all included tables together without `CASCADE`
+- Refuses to erase excluded dependent tables
+- Re-enables constraints on commit and verifies foreign-key integrity afterward
 
 ### Sequences
 
-After importing data, all PostgreSQL sequences are reset to `MAX(id) + 1` to prevent primary key conflicts on new inserts.
+After importing data, owned PostgreSQL sequences are moved beyond the current
+`MAX(id)` (or below `MIN(id)` for descending sequences) to prevent primary-key conflicts.
+
+Ascending and descending serial/identity sequences are reset using exact PostgreSQL
+`bigint` strings rather than relying on JavaScript number precision.
+
+### Storage Behavior
+
+Storage sync creates missing buckets and upserts source objects. It does not delete
+target-only objects or overwrite settings on an existing bucket. Before the first
+target Storage write, every selected object is preflighted; missing size metadata or
+an object larger than `storage.maxFileSizeMB` fails the run rather than being skipped.
+Storage writes are not transactional: uploads completed before a later failure remain.
+Only public Storage object URLs (`/storage/v1/object/public/`) are rewritten, in auth
+avatar fields and URL-named text columns in the selected application schemas.
 
 ## GitHub Actions Example
 
@@ -318,7 +403,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Install PostgreSQL client
-        run: sudo apt-get install -y postgresql-client
+        run: |
+          sudo apt-get install -y postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh
+          sudo apt-get install -y postgresql-client-16
+          psql --version
 
       - name: Run sync
         env:
@@ -343,7 +432,8 @@ npx supabase-sync test-connection --config ./config.json
 ### Invalid Database URL
 
 Ensure your database URL:
-- Starts with `postgresql://`
+- Starts with `postgresql://` or `postgres://`
+- Includes an explicit user, host, and database name
 - Contains the correct password (URL-encoded if special characters)
 - Uses the correct port (5432 for cloud, 54322 for local)
 
@@ -361,13 +451,15 @@ Ensure PostgreSQL client tools are installed and in your PATH:
 
 ```bash
 which pg_dump
+which pg_dumpall
 which psql
 ```
 
 ### Permission Errors
 
 - Ensure database user has sufficient privileges (postgres user recommended)
-- Service role key must have admin access for auth operations
+- Database credentials need access to the `auth` schema for auth migration
+- The admin API key needs Storage read/write access when storage sync is enabled
 
 ### Timeout on Large Databases
 

@@ -15,9 +15,14 @@ const MANAGED_SCHEMAS = new Set([
 ]);
 
 export function getApplicationSchemas(config: Config): string[] {
+  const excludedSchemas = new Set(
+    config.options.database.excludeSchemas.map(schema => schema.trim().toLowerCase())
+  );
+
   return config.options.database.includeSchemas
     .map(schema => schema.trim())
     .filter(Boolean)
+    .filter(schema => !excludedSchemas.has(schema.toLowerCase()))
     .filter(schema => !MANAGED_SCHEMAS.has(schema.toLowerCase()));
 }
 
