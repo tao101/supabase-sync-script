@@ -355,11 +355,17 @@ export class StorageSync {
 
       // Find and update text columns containing storage URLs in public schema
       const columnsResult = await client.query(`
-        SELECT table_schema, table_name, column_name
-        FROM information_schema.columns
-        WHERE table_schema = ANY($1)
-        AND data_type IN ('text', 'character varying')
-        AND column_name LIKE '%url%'
+        SELECT columns.table_schema, columns.table_name, columns.column_name
+        FROM information_schema.columns AS columns
+        JOIN information_schema.tables AS tables
+          ON tables.table_schema = columns.table_schema
+          AND tables.table_name = columns.table_name
+        WHERE columns.table_schema = ANY($1)
+        AND tables.table_type = 'BASE TABLE'
+        AND columns.is_updatable = 'YES'
+        AND columns.is_generated = 'NEVER'
+        AND columns.data_type IN ('text', 'character varying')
+        AND columns.column_name LIKE '%url%'
       `, [getApplicationSchemas(this.config)]);
 
       for (const row of columnsResult.rows) {

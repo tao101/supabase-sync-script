@@ -117,10 +117,13 @@ test('rewrites only public Storage object URL prefixes', async () => {
   await sync.rewriteStorageUrls();
 
   const rewriteCall = calls.find(call => call.values?.length === 2);
+  const columnsCall = calls.find(call => call.text.includes('information_schema.columns'));
   assert.deepEqual(rewriteCall?.values, [
     'https://source.example.com/storage/v1/object/public/',
     'https://target.example.com/storage/v1/object/public/',
   ]);
   assert.match(rewriteCall!.text, /left\(/);
   assert.doesNotMatch(rewriteCall!.text, /LIKE/);
+  assert.match(columnsCall!.text, /table_type = 'BASE TABLE'/);
+  assert.match(columnsCall!.text, /is_generated = 'NEVER'/);
 });
