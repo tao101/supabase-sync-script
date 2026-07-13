@@ -57,3 +57,42 @@ test('refuses to remove target-only users while application rows reference them'
   await assert.rejects(sync.cleanupTargetOnlyUsers(client), /still references them/);
   assert.equal(queries.some(query => query.startsWith('DELETE FROM auth.users')), false);
 });
+
+test('prepares target users to omit hashes and clear target-only unique conflicts', async () => {
+  const calls: { text: string; values?: unknown[] }[] = [];
+  const client = {
+    async query(text: string, values?: unknown[]) {
+      calls.push({ text, values });
+      return { rows: [], rowCount: 0 };
+    },
+  };
+  const config = structuredClone(baseConfig);
+  config.options.auth.preservePasswordHashes = false;
+  const sync = new AuthSync(config, {} as never, {} as never) as unknown as {
+    prepareTargetUsers(
+      users: Record<string, unknown>[],
+      commonColumns: string[],
+      client: unknown
+    ): Promise<void>;
+  };
+
+  await sync.prepareTargetUsers(
+    [{
+      id: '00000000-0000-0000-0000-000000000001',
+      email: 'user@example.com',
+      phone: '+15555550123',
+    }],
+    ['id', 'email', 'phone', 'encrypted_password'],
+    client
+  );
+
+  assert.equal(calls.length, 3);
+  assert.match(calls[0].text, /SET encrypted_password = NULL/);
+  assert.deepEqual(calls[0].values, [['00000000-0000-0000-0000-000000000001']]);
+  assert.match(calls[1].text, /SET "email" = NULL/);
+  assert.deepEqual(calls[1].values, [
+    ['00000000-0000-0000-0000-000000000001'],
+    ['user@example.com'],
+  ]);
+  assert.match(calls[2].text, /SET "phone" = NULL/);
+});

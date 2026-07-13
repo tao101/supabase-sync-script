@@ -208,6 +208,37 @@ export class AuthSync {
     logger.info('Target auth data cleared');
   }
 
+  private async prepareTargetUsers(
+    users: AuthRow[],
+    commonColumns: string[],
+    client: pg.PoolClient
+  ): Promise<void> {
+    const sourceUserIds = users.map(user => String(user.id));
+    if (sourceUserIds.length === 0) return;
+
+    if (!this.config.options.auth.preservePasswordHashes && commonColumns.includes('encrypted_password')) {
+      await client.query(
+        'UPDATE auth.users SET encrypted_password = NULL WHERE id = ANY($1::uuid[])',
+        [sourceUserIds]
+      );
+    }
+
+    for (const column of ['email', 'phone'].filter(column => commonColumns.includes(column))) {
+      const sourceValues = [...new Set(users
+        .map(user => user[column])
+        .filter((value): value is string => typeof value === 'string'))];
+      if (sourceValues.length === 0) continue;
+
+      const identifier = this.quoteIdentifier(column);
+      await client.query(`
+        UPDATE auth.users
+        SET ${identifier} = NULL
+        WHERE NOT (id = ANY($1::uuid[]))
+          AND ${identifier} = ANY($2::text[])
+      `, [sourceUserIds, sourceValues]);
+    }
+  }
+
   async cleanupTargetOnlyUsers(client?: pg.PoolClient): Promise<number> {
     if (!this.sourceUserIds) throw new Error('Auth users must be exported before cleanup');
 
@@ -420,6 +451,7 @@ export class AuthSync {
 
       // Clear target using the same connection
       await this.clearTargetAuth(client);
+      await this.prepareTargetUsers(users, commonUserColumns, client);
 
       // Import users in batches using the same connection
       logger.info(`Importing ${users.length} users in batches of ${BATCH_SIZE}...`);
