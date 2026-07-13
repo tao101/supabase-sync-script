@@ -117,6 +117,36 @@ test('schema sync atomically replaces the target schema', { skip }, async () => 
   }
 });
 
+test('schema reset refuses external dependencies on custom operators', { skip }, async () => {
+  await resetSchemas();
+  await targetPool.query(`
+    DROP SCHEMA IF EXISTS analytics CASCADE;
+    CREATE SCHEMA analytics;
+    CREATE FUNCTION public.same_integer(integer, integer)
+    RETURNS boolean LANGUAGE sql IMMUTABLE AS 'SELECT $1 = $2';
+    CREATE OPERATOR public.=== (
+      LEFTARG = integer,
+      RIGHTARG = integer,
+      FUNCTION = public.same_integer
+    );
+    CREATE VIEW analytics.external_view AS
+      SELECT 1 AS value WHERE 1 OPERATOR(public.===) 1;
+  `);
+  const files = new TempFileManager();
+  await files.init();
+
+  try {
+    const sync = new SchemaSync(config, files, targetPool, sourcePool);
+    await assert.rejects(
+      sync.prepareTargetSchemas(),
+      /objects outside the application schemas depend on them/
+    );
+  } finally {
+    await files.cleanup();
+    await targetPool.query('DROP SCHEMA analytics CASCADE');
+  }
+});
+
 test('data import rollback preserves rows cleared in the same transaction', { skip }, async () => {
   await resetSchemas();
   await targetPool.query('CREATE TABLE public.items (id integer PRIMARY KEY)');

@@ -54,6 +54,9 @@ test('prepares schema reset and privilege SQL without mutating the target', asyn
   assert.match(prepared.resetSql, /DROP SCHEMA IF EXISTS "public" CASCADE;/);
   assert.match(prepared.resetSql, /CREATE SCHEMA "public";/);
   assert.match(prepared.finalizeSql, /ALTER SCHEMA "public" OWNER TO "app_owner";/);
+  const dependencyQuery = queries.find(query => query.includes('dependency_schemas'))!;
+  assert.match(dependencyQuery, /schema_objects AS/);
+  assert.match(dependencyQuery, /refclassid = 'pg_namespace'::regclass/);
   assert.equal(queries.some(query => /^\s*(DROP|CREATE|BEGIN|COMMIT)/.test(query)), false);
 });
 

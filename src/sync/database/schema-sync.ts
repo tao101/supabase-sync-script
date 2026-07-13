@@ -173,21 +173,21 @@ export class SchemaSync {
       }
 
       const dependenciesResult = await client.query(`
-        WITH app_objects AS (
-          SELECT 'pg_class'::regclass::oid AS classid, c.oid AS objid
-          FROM pg_class c
-          JOIN pg_namespace n ON n.oid = c.relnamespace
-          WHERE n.nspname = ANY($1::text[])
-          UNION ALL
-          SELECT 'pg_proc'::regclass::oid, p.oid
-          FROM pg_proc p
-          JOIN pg_namespace n ON n.oid = p.pronamespace
-          WHERE n.nspname = ANY($1::text[])
-          UNION ALL
-          SELECT 'pg_type'::regclass::oid, t.oid
-          FROM pg_type t
-          JOIN pg_namespace n ON n.oid = t.typnamespace
-          WHERE n.nspname = ANY($1::text[])
+        WITH schema_objects AS (
+          SELECT
+            dependency.classid,
+            dependency.objid,
+            namespace_obj.nspname AS schema_name
+          FROM pg_depend dependency
+          JOIN pg_namespace namespace_obj
+            ON dependency.refclassid = 'pg_namespace'::regclass
+            AND dependency.refobjid = namespace_obj.oid
+          WHERE dependency.deptype = 'n'
+        ),
+        app_objects AS (
+          SELECT classid, objid
+          FROM schema_objects
+          WHERE schema_name = ANY($1::text[])
         ),
         dependencies AS (
           SELECT
@@ -215,6 +215,7 @@ export class SchemaSync {
         dependency_schemas AS (
           SELECT
             COALESCE(
+              direct_ns.schema_name,
               class_ns.nspname,
               proc_ns.nspname,
               type_ns.nspname,
@@ -227,6 +228,7 @@ export class SchemaSync {
             dependent_object,
             referenced_object
           FROM dependencies d
+          LEFT JOIN schema_objects direct_ns ON direct_ns.classid = d.classid AND direct_ns.objid = d.objid
           LEFT JOIN pg_class class_obj ON d.classid = 'pg_class'::regclass AND d.objid = class_obj.oid
           LEFT JOIN pg_namespace class_ns ON class_ns.oid = class_obj.relnamespace
           LEFT JOIN pg_proc proc_obj ON d.classid = 'pg_proc'::regclass AND d.objid = proc_obj.oid
