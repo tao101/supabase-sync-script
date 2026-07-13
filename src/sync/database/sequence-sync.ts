@@ -1,9 +1,9 @@
 import pg from 'pg';
 import type { Config } from '../../types/config.js';
 import { logger } from '../../utils/logger.js';
-import { SyncError, ErrorCategory, SequenceInfo, SequenceResetResult } from '../../types/sync.js';
+import { SequenceInfo, SequenceResetResult } from '../../types/sync.js';
 import type { PostgresPool } from '../../clients/postgres-client.js';
-import { getApplicationSchemas } from './schemas.js';
+import { getApplicationSchemas, quoteIdentifier } from './schemas.js';
 
 // Query to find all sequences and their owning tables/columns
 const FIND_SEQUENCES_QUERY = `
@@ -11,14 +11,17 @@ const FIND_SEQUENCES_QUERY = `
     seq.relname AS sequence_name,
     ns.nspname AS schema_name,
     tab.relname AS table_name,
-    attr.attname AS column_name
+    attr.attname AS column_name,
+    seq_meta.seqincrement::text AS increment_by,
+    seq_meta.seqstart::text AS start_value
   FROM pg_class seq
   JOIN pg_namespace ns ON seq.relnamespace = ns.oid
+  JOIN pg_sequence seq_meta ON seq_meta.seqrelid = seq.oid
   JOIN pg_depend dep ON seq.oid = dep.objid
   JOIN pg_class tab ON dep.refobjid = tab.oid
   JOIN pg_attribute attr ON attr.attrelid = tab.oid AND attr.attnum = dep.refobjsubid
   WHERE seq.relkind = 'S'
-    AND dep.deptype = 'a'
+    AND dep.deptype IN ('a', 'i')
     AND ns.nspname = ANY($1)
   ORDER BY ns.nspname, seq.relname
 `;
@@ -50,38 +53,38 @@ export class SequenceSync {
     tableName: string,
     columnName: string,
     sequenceName: string,
-    client?: pg.PoolClient
+    client?: pg.PoolClient,
+    incrementBy: string = '1',
+    startValue: string = '1'
   ): Promise<SequenceResetResult> {
     const ownClient = !client;
     const dbClient = client ?? await this.targetPool.connect();
     try {
-      // Get max value from the table
-      const maxResult = await dbClient.query(
-        `SELECT COALESCE(MAX("${columnName}"), 0) as max_val FROM "${schemaName}"."${tableName}"`
+      const descending = BigInt(incrementBy) < 0n;
+      const aggregate = descending ? 'MIN' : 'MAX';
+      const boundaryResult = await dbClient.query(
+        `SELECT ${aggregate}(${quoteIdentifier(columnName)})::text as boundary_value FROM ${quoteIdentifier(schemaName)}.${quoteIdentifier(tableName)}`
       );
-      const maxVal = parseInt(maxResult.rows[0]?.max_val || '0', 10);
+      const boundaryValue = boundaryResult.rows[0]?.boundary_value as string | null | undefined;
 
-      // Set sequence value
-      // setval(sequence, value, is_called)
-      // is_called = true means next call to nextval will return value + 1
-      // is_called = false means next call will return value
-      const newValue = maxVal > 0 ? maxVal : 1;
-      const isCalled = maxVal > 0;
+      const newValueExact = boundaryValue ?? startValue;
+      const isCalled = boundaryValue !== null && boundaryValue !== undefined;
 
       await dbClient.query(
-        `SELECT setval('"${schemaName}"."${sequenceName}"', $1, $2)`,
-        [newValue, isCalled]
+        'SELECT setval($1::regclass, $2, $3)',
+        [`${quoteIdentifier(schemaName)}.${quoteIdentifier(sequenceName)}`, newValueExact, isCalled]
       );
 
       logger.debug(
-        `Reset sequence ${schemaName}.${sequenceName} to ${newValue} (is_called=${isCalled})`
+        `Reset sequence ${schemaName}.${sequenceName} to ${newValueExact} (is_called=${isCalled})`
       );
 
       return {
         sequence: `${schemaName}.${sequenceName}`,
         table: `${schemaName}.${tableName}`,
         column: columnName,
-        newValue,
+        newValue: Number(newValueExact),
+        newValueExact,
       };
     } finally {
       // Only release if we acquired the client ourselves
@@ -107,7 +110,9 @@ export class SequenceSync {
             seq.table_name,
             seq.column_name,
             seq.sequence_name,
-            client
+            client,
+            seq.increment_by,
+            seq.start_value
           );
           results.push(result);
         } catch (error) {
@@ -136,25 +141,27 @@ export class SequenceSync {
         try {
           // Get current sequence value
           const seqResult = await client.query(
-            `SELECT last_value, is_called FROM "${seq.schema_name}"."${seq.sequence_name}"`
+            `SELECT last_value::text AS last_value, is_called FROM ${quoteIdentifier(seq.schema_name)}.${quoteIdentifier(seq.sequence_name)}`
           );
-          const lastValue = parseInt(seqResult.rows[0]?.last_value || '0', 10);
+          const lastValue = BigInt(seqResult.rows[0]?.last_value || '0');
           const isCalled = seqResult.rows[0]?.is_called;
+          const increment = BigInt(seq.increment_by ?? '1');
+          const aggregate = increment < 0n ? 'MIN' : 'MAX';
 
-          // Get max value from table
-          const maxResult = await client.query(
-            `SELECT COALESCE(MAX("${seq.column_name}"), 0) as max_val FROM "${seq.schema_name}"."${seq.table_name}"`
+          const boundaryResult = await client.query(
+            `SELECT ${aggregate}(${quoteIdentifier(seq.column_name)})::text AS boundary_value FROM ${quoteIdentifier(seq.schema_name)}.${quoteIdentifier(seq.table_name)}`
           );
-          const maxVal = parseInt(maxResult.rows[0]?.max_val || '0', 10);
+          const rawBoundary = boundaryResult.rows[0]?.boundary_value as string | null | undefined;
+          if (rawBoundary === null || rawBoundary === undefined) continue;
+          const boundaryValue = BigInt(rawBoundary);
 
-          // Verify: next sequence value should be > max value in table
-          // PostgreSQL behavior:
-          // - is_called = true → next value will be last_value + 1
-          // - is_called = false → next value will be last_value
-          const nextValue = isCalled ? lastValue + 1 : lastValue;
-          if (nextValue <= maxVal) {
+          const nextValue = isCalled ? lastValue + increment : lastValue;
+          const invalid = increment > 0n
+            ? nextValue <= boundaryValue
+            : nextValue >= boundaryValue;
+          if (invalid) {
             logger.warn(
-              `Sequence ${seq.schema_name}.${seq.sequence_name} next value (${nextValue}) <= max value in ${seq.schema_name}.${seq.table_name} (${maxVal})`
+              `Sequence ${seq.schema_name}.${seq.sequence_name} next value (${nextValue}) conflicts with ${aggregate} value in ${seq.schema_name}.${seq.table_name} (${boundaryValue})`
             );
             allValid = false;
           }
@@ -182,12 +189,16 @@ export class SequenceSync {
     if (this.config.dryRun) {
       logger.info('[DRY RUN] Would reset all sequences');
       const sequences = await this.findSequences();
-      return sequences.map(seq => ({
-        sequence: `${seq.schema_name}.${seq.sequence_name}`,
-        table: `${seq.schema_name}.${seq.table_name}`,
-        column: seq.column_name,
-        newValue: 0,
-      }));
+      return sequences.map(seq => {
+        const newValueExact = seq.start_value ?? '1';
+        return {
+          sequence: `${seq.schema_name}.${seq.sequence_name}`,
+          table: `${seq.schema_name}.${seq.table_name}`,
+          column: seq.column_name,
+          newValue: Number(newValueExact),
+          newValueExact,
+        };
+      });
     }
 
     return this.resetAllSequences();

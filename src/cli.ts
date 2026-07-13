@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { Command } from 'commander';
+import { createRequire } from 'module';
 import chalk from 'chalk';
 import { loadConfig, validateConfig, ConnectionBuilder } from './config/index.js';
 import { SyncOrchestrator } from './core/sync-orchestrator.js';
@@ -10,17 +11,19 @@ import {
   createSpinner,
 } from './modes/interactive-mode.js';
 import { loadCIConfig, printCISummary, logCIConnectionTest, printCIValidationResult } from './modes/ci-mode.js';
-import { logger, setLogLevel, print } from './utils/logger.js';
-import { detectCIEnvironment } from './config/env.js';
+import { logger, sanitizeErrorMessage, setLogLevel, print } from './utils/logger.js';
+import { resolveCIMode } from './config/env.js';
 import { testPostgresConnection, createPostgresPool } from './clients/postgres-client.js';
 import { testSupabaseConnection, createSupabaseClient } from './clients/supabase-client.js';
+import { requiresPostgresTools, testPostgresTools } from './utils/postgres-tools.js';
 
 const program = new Command();
+const { version } = createRequire(import.meta.url)('../package.json') as { version: string };
 
 program
   .name('supabase-sync')
   .description('Full migration sync between Supabase instances')
-  .version('1.0.0');
+  .version(version);
 
 program
   .command('sync')
@@ -40,64 +43,54 @@ program
         setLogLevel('debug');
       }
 
-      const isCI = options.ci || detectCIEnvironment();
-      let config;
+      let config = options.config
+        ? await loadConfig({
+          configPath: options.config,
+          overrides: {
+            mode: options.ci ? 'ci' : undefined,
+            dryRun: options.dryRun,
+            verbose: options.verbose,
+          },
+        })
+        : undefined;
+      const isCI = resolveCIMode(options.ci, config?.mode);
 
       if (isCI) {
-        // CI mode
-        config = await loadCIConfig({
+        config ??= await loadCIConfig({
           configPath: options.config,
           overrides: {
             dryRun: options.dryRun,
             verbose: options.verbose,
           },
         });
-
-        // Apply skip flags
-        if (options.skipSchema) config.options.components.schema = false;
-        if (options.skipData) config.options.components.data = false;
-        if (options.skipAuth) config.options.components.auth = false;
-        if (options.skipStorage) config.options.components.storage = false;
-        if (options.skipRoles) config.options.components.roles = false;
+        config.mode = 'ci';
       } else {
         // Interactive mode
         print.header('Supabase Sync Script');
         console.log(chalk.gray('This tool will sync data between Supabase instances.\n'));
 
-        if (options.config) {
-          // Load from config but allow interactive confirmation
-          config = await loadConfig({
-            configPath: options.config,
-            overrides: {
-              mode: 'interactive',
-              dryRun: options.dryRun,
-              verbose: options.verbose,
-            },
-          });
-        } else {
+        if (!config) {
           // Fully interactive config gathering
-          config = await gatherFullConfig();
+          config = await gatherFullConfig({
+            schema: options.skipSchema,
+            data: options.skipData,
+            auth: options.skipAuth,
+            storage: options.skipStorage,
+            roles: options.skipRoles,
+          });
           config.dryRun = options.dryRun ?? config.dryRun;
           config.verbose = options.verbose ?? config.verbose;
         }
-
-        // Apply skip flags
-        if (options.skipSchema) config.options.components.schema = false;
-        if (options.skipData) config.options.components.data = false;
-        if (options.skipAuth) config.options.components.auth = false;
-        if (options.skipStorage) config.options.components.storage = false;
-        if (options.skipRoles) config.options.components.roles = false;
-
-        // Confirm destructive operation
-        const builder = new ConnectionBuilder();
-        const targetHost = builder.getHostFromDbUrl(config.target.dbUrl);
-        const confirmed = await confirmDestructiveOperation(targetHost);
-
-        if (!confirmed) {
-          print.warning('Sync cancelled by user');
-          process.exit(0);
-        }
       }
+
+      if (config.verbose) setLogLevel('debug');
+
+      // Apply skip flags before validation so skipped components need no setup.
+      if (options.skipSchema) config.options.components.schema = false;
+      if (options.skipData) config.options.components.data = false;
+      if (options.skipAuth) config.options.components.auth = false;
+      if (options.skipStorage) config.options.components.storage = false;
+      if (options.skipRoles) config.options.components.roles = false;
 
       // Validate config
       const errors = validateConfig(config);
@@ -105,6 +98,38 @@ program
         print.error('Configuration validation failed:');
         errors.forEach(e => console.log(chalk.red(`  - ${e}`)));
         process.exit(1);
+      }
+
+      if (isCI) {
+        const target = new ConnectionBuilder().getSafeDisplay(config.target);
+        const components = Object.entries(config.options.components)
+          .filter(([, enabled]) => enabled)
+          .map(([name]) => name)
+          .join(', ');
+        console.log(`Plan: ${config.dryRun ? 'DRY RUN' : 'APPLY'}`);
+        console.log(`Target database: ${target.dbUrl}`);
+        if (config.options.components.storage) console.log(`Target Storage API: ${target.apiUrl}`);
+        console.log(`Components: ${components}`);
+      }
+
+      if (!isCI) {
+        if (config.dryRun) {
+          print.info('Dry run: no target data will be changed');
+        } else {
+          const builder = new ConnectionBuilder();
+          const target = builder.getSafeDisplay(config.target);
+          const confirmed = await confirmDestructiveOperation(
+            [
+              `Database: ${target.dbUrl}`,
+              config.options.components.storage ? `Storage API: ${target.apiUrl}` : '',
+            ].filter(Boolean).join('\n  '),
+            config
+          );
+          if (!confirmed) {
+            print.warning('Sync cancelled by user');
+            process.exit(0);
+          }
+        }
       }
 
       // Run sync
@@ -129,9 +154,14 @@ program
         console.log(chalk.gray(`Duration: ${(result.duration / 1000).toFixed(2)}s`));
         console.log('\nSteps:');
         for (const step of result.steps) {
-          const icon = step.success ? chalk.green('✓') : chalk.red('✗');
+          const icon = step.status === 'planned'
+            ? chalk.cyan('○')
+            : step.status === 'warning' ? chalk.yellow('!') : step.success ? chalk.green('✓') : chalk.red('✗');
+          const label = step.status === 'planned'
+            ? chalk.cyan(' [PLANNED]')
+            : step.status === 'warning' ? chalk.yellow(' [WARNING]') : '';
           const duration = chalk.gray(`(${(step.duration / 1000).toFixed(2)}s)`);
-          console.log(`  ${icon} ${step.name} ${duration}`);
+          console.log(`  ${icon} ${step.name}${label} ${duration}`);
         }
 
         if (result.warnings && result.warnings.length > 0) {
@@ -151,7 +181,7 @@ program
     } catch (error) {
       logger.error('Sync failed:', { error: (error as Error).message });
       if (options.verbose) {
-        console.error(error);
+        console.error(sanitizeErrorMessage((error as Error).stack || (error as Error).message));
       }
       process.exit(1);
     }
@@ -164,8 +194,11 @@ program
   .option('--ci', 'Run in CI mode (non-interactive)')
   .action(async (options) => {
     try {
-      const isCI = options.ci || detectCIEnvironment();
-      const config = await loadConfig({ configPath: options.config });
+      const config = await loadConfig({
+        configPath: options.config,
+        overrides: { mode: options.ci ? 'ci' : undefined },
+      });
+      const isCI = resolveCIMode(options.ci, config.mode);
       const errors = validateConfig(config);
 
       if (errors.length > 0) {
@@ -182,8 +215,8 @@ program
 
       if (isCI) {
         printCIValidationResult(true, []);
-        console.log(`Source: ${builder.getSafeDisplay(config.source)}`);
-        console.log(`Target: ${builder.getSafeDisplay(config.target)}`);
+        console.log(`Source: ${JSON.stringify(builder.getSafeDisplay(config.source))}`);
+        console.log(`Target: ${JSON.stringify(builder.getSafeDisplay(config.target))}`);
         console.log(`Components: ${JSON.stringify(config.options.components)}`);
       } else {
         print.success('Configuration is valid');
@@ -204,11 +237,15 @@ program
   .option('--ci', 'Run in CI mode (non-interactive)')
   .action(async (options) => {
     try {
-      const isCI = options.ci || detectCIEnvironment();
+      let isCI = resolveCIMode(options.ci);
       let config;
 
       if (options.config || isCI) {
-        config = await loadConfig({ configPath: options.config });
+        config = await loadConfig({
+          configPath: options.config,
+          overrides: { mode: options.ci ? 'ci' : undefined },
+        });
+        isCI = resolveCIMode(options.ci, config.mode);
       } else {
         config = await gatherFullConfig();
       }
@@ -242,20 +279,34 @@ program
         logCIConnectionTest('Target database', targetDbResult.success ? 'success' : 'failed',
           targetDbResult.success ? undefined : targetDbResult.error || 'Unknown error');
 
-        // Test source Supabase API
-        logCIConnectionTest('Source Supabase API', 'testing');
-        const sourceSupabase = createSupabaseClient(config.source);
-        const sourceApiOk = await testSupabaseConnection(sourceSupabase);
-        logCIConnectionTest('Source Supabase API', sourceApiOk ? 'success' : 'failed');
+        let postgresToolsOk = true;
+        if (requiresPostgresTools(config)) {
+          logCIConnectionTest('PostgreSQL client tools', 'testing');
+          const toolsResult = await testPostgresTools(config);
+          postgresToolsOk = toolsResult.success;
+          logCIConnectionTest(
+            'PostgreSQL client tools',
+            toolsResult.success ? 'success' : 'failed',
+            toolsResult.error
+          );
+        }
 
-        // Test target Supabase API
-        logCIConnectionTest('Target Supabase API', 'testing');
-        const targetSupabase = createSupabaseClient(config.target);
-        const targetApiOk = await testSupabaseConnection(targetSupabase);
-        logCIConnectionTest('Target Supabase API', targetApiOk ? 'success' : 'failed');
+        let sourceApiOk = true;
+        let targetApiOk = true;
+        if (config.options.components.storage) {
+          logCIConnectionTest('Source Supabase API', 'testing');
+          sourceApiOk = await testSupabaseConnection(createSupabaseClient(config.source, 15_000));
+          logCIConnectionTest('Source Supabase API', sourceApiOk ? 'success' : 'failed');
+
+          logCIConnectionTest('Target Supabase API', 'testing');
+          targetApiOk = await testSupabaseConnection(createSupabaseClient(config.target, 15_000));
+          logCIConnectionTest('Target Supabase API', targetApiOk ? 'success' : 'failed');
+        } else {
+          logCIConnectionTest('Supabase APIs', 'skipped', 'storage sync is disabled');
+        }
 
         // Summary
-        const allOk = sourceDbResult.success && targetDbResult.success && sourceApiOk && targetApiOk;
+        const allOk = sourceDbResult.success && targetDbResult.success && postgresToolsOk && sourceApiOk && targetApiOk;
         console.log('='.repeat(40));
         if (allOk) {
           console.log('[OK] All connections successful');
@@ -293,32 +344,39 @@ program
           targetSpinner.fail(`Target database: FAILED - ${targetDbResult.error || 'Unknown error'}`);
         }
 
-        // Test source Supabase API
-        const sourceApiSpinner = createSpinner('Testing source Supabase API...');
-        sourceApiSpinner.start();
-        const sourceSupabase = createSupabaseClient(config.source);
-        const sourceApiOk = await testSupabaseConnection(sourceSupabase);
-
-        if (sourceApiOk) {
-          sourceApiSpinner.succeed('Source Supabase API: OK');
-        } else {
-          sourceApiSpinner.fail('Source Supabase API: FAILED');
+        let postgresToolsOk = true;
+        if (requiresPostgresTools(config)) {
+          const toolsSpinner = createSpinner('Testing PostgreSQL client tools...');
+          toolsSpinner.start();
+          const toolsResult = await testPostgresTools(config);
+          postgresToolsOk = toolsResult.success;
+          toolsResult.success
+            ? toolsSpinner.succeed('PostgreSQL client tools: OK')
+            : toolsSpinner.fail(`PostgreSQL client tools: FAILED - ${toolsResult.error || 'Unknown error'}`);
         }
 
-        // Test target Supabase API
-        const targetApiSpinner = createSpinner('Testing target Supabase API...');
-        targetApiSpinner.start();
-        const targetSupabase = createSupabaseClient(config.target);
-        const targetApiOk = await testSupabaseConnection(targetSupabase);
+        let sourceApiOk = true;
+        let targetApiOk = true;
+        if (config.options.components.storage) {
+          const sourceApiSpinner = createSpinner('Testing source Supabase API...');
+          sourceApiSpinner.start();
+          sourceApiOk = await testSupabaseConnection(createSupabaseClient(config.source, 15_000));
+          sourceApiOk
+            ? sourceApiSpinner.succeed('Source Supabase API: OK')
+            : sourceApiSpinner.fail('Source Supabase API: FAILED');
 
-        if (targetApiOk) {
-          targetApiSpinner.succeed('Target Supabase API: OK');
+          const targetApiSpinner = createSpinner('Testing target Supabase API...');
+          targetApiSpinner.start();
+          targetApiOk = await testSupabaseConnection(createSupabaseClient(config.target, 15_000));
+          targetApiOk
+            ? targetApiSpinner.succeed('Target Supabase API: OK')
+            : targetApiSpinner.fail('Target Supabase API: FAILED');
         } else {
-          targetApiSpinner.fail('Target Supabase API: FAILED');
+          print.info('Supabase API tests skipped because storage sync is disabled');
         }
 
         // Summary
-        const allOk = sourceDbResult.success && targetDbResult.success && sourceApiOk && targetApiOk;
+        const allOk = sourceDbResult.success && targetDbResult.success && postgresToolsOk && sourceApiOk && targetApiOk;
         console.log();
         if (allOk) {
           print.success('All connections successful!');

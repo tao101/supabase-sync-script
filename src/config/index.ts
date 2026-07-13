@@ -10,6 +10,7 @@ import {
 } from './env.js';
 import { ConnectionBuilder } from './connection-builder.js';
 import { logger, sanitizeConfig } from '../utils/logger.js';
+import { getApplicationSchemas, getManagedSchemas } from '../sync/database/schemas.js';
 
 export { ConnectionBuilder } from './connection-builder.js';
 
@@ -58,15 +59,39 @@ function removeUndefined<T extends Record<string, unknown>>(obj: T): Partial<T> 
   return result;
 }
 
-export async function loadConfigFromFile(configPath: string): Promise<Partial<Config>> {
+function normalizeLegacyTemplateMetadata(config: Partial<Config>): Partial<Config> {
+  const normalized = { ...config } as Record<string, unknown>;
+  delete normalized._comment;
+
+  for (const key of ['source', 'target']) {
+    const connection = normalized[key];
+    if (!connection || typeof connection !== 'object' || Array.isArray(connection)) continue;
+
+    const cleaned = { ...connection } as Record<string, unknown>;
+    delete cleaned._keys_option_a;
+    delete cleaned._keys_option_b;
+    delete cleaned._secretKey;
+    normalized[key] = cleaned;
+  }
+
+  return normalized as Partial<Config>;
+}
+
+export async function loadConfigFromFile(
+  configPath: string,
+  ignoreMissing: boolean = false
+): Promise<Partial<Config>> {
   try {
     const absolutePath = path.resolve(configPath);
     const content = await fs.readFile(absolutePath, 'utf-8');
     return JSON.parse(content);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-      logger.debug(`Config file not found: ${configPath}`);
-      return {};
+      if (ignoreMissing) {
+        logger.debug(`Config file not found: ${configPath}`);
+        return {};
+      }
+      throw new Error(`Config file not found: ${path.resolve(configPath)}`);
     }
     throw error;
   }
@@ -83,6 +108,9 @@ export async function loadConfig(options: {
   const envTarget = removeUndefined(loadTargetFromEnv());
   const envOptions = removeUndefined(loadOptionsFromEnv());
   const envConfig = removeUndefined(loadConfigFromEnv());
+  const cleanedOverrides = removeUndefined(
+    overrides as unknown as Record<string, unknown>
+  ) as Partial<Config>;
 
   // Load from file if provided
   let fileConfig: Partial<Config> = {};
@@ -92,7 +120,7 @@ export async function loadConfig(options: {
     // Try default locations
     const defaultPaths = ['./sync-config.json', './config.json', './.supabase-sync.json'];
     for (const defaultPath of defaultPaths) {
-      fileConfig = await loadConfigFromFile(defaultPath);
+      fileConfig = await loadConfigFromFile(defaultPath, true);
       if (Object.keys(fileConfig).length > 0) {
         logger.info(`Loaded config from ${defaultPath}`);
         break;
@@ -104,19 +132,28 @@ export async function loadConfig(options: {
   const mergedConfig: Partial<Config> = {
     ...fileConfig,
     ...envConfig,
+    ...cleanedOverrides,
     source: deepMerge(
-      (fileConfig.source || {}) as SupabaseConnection,
-      envSource as Partial<SupabaseConnection>
+      deepMerge(
+        (fileConfig.source || {}) as SupabaseConnection,
+        envSource as Partial<SupabaseConnection>
+      ),
+      (cleanedOverrides.source || {}) as Partial<SupabaseConnection>
     ),
     target: deepMerge(
-      (fileConfig.target || {}) as SupabaseConnection,
-      envTarget as Partial<SupabaseConnection>
+      deepMerge(
+        (fileConfig.target || {}) as SupabaseConnection,
+        envTarget as Partial<SupabaseConnection>
+      ),
+      (cleanedOverrides.target || {}) as Partial<SupabaseConnection>
     ),
     options: deepMerge(
-      (fileConfig.options || {}) as Config['options'],
-      envOptions as Partial<Config['options']>
+      deepMerge(
+        (fileConfig.options || {}) as Config['options'],
+        envOptions as Partial<Config['options']>
+      ),
+      (cleanedOverrides.options || {}) as Partial<Config['options']>
     ),
-    ...overrides,
   };
 
   // Auto-detect CI mode if not explicitly set
@@ -126,7 +163,7 @@ export async function loadConfig(options: {
   }
 
   // Validate with Zod
-  const result = ConfigSchema.safeParse(mergedConfig);
+  const result = ConfigSchema.safeParse(normalizeLegacyTemplateMetadata(mergedConfig));
 
   if (!result.success) {
     const errors = result.error.errors.map(e => `${e.path.join('.')}: ${e.message}`);
@@ -218,18 +255,65 @@ function validateKeyPair(connection: SupabaseConnection, prefix: string): string
 export function validateConfig(config: Config): string[] {
   const errors: string[] = [];
   const builder = new ConnectionBuilder();
+  const requiresApi = config.options.components.storage;
+  const syncsApplicationDatabase = config.options.components.schema || config.options.components.data;
+
+  if (!Object.values(config.options.components).some(Boolean)) {
+    errors.push('At least one sync component must be enabled');
+  }
 
   // Validate source connection
-  const sourceErrors = builder.validateConnection(config.source);
+  const sourceErrors = builder.validateConnection(config.source, requiresApi);
   errors.push(...sourceErrors.map(e => `Source: ${e}`));
 
   // Validate target connection
-  const targetErrors = builder.validateConnection(config.target);
+  const targetErrors = builder.validateConnection(config.target, requiresApi);
   errors.push(...targetErrors.map(e => `Target: ${e}`));
 
   // Validate key pairs for source and target
-  errors.push(...validateKeyPair(config.source, 'Source'));
-  errors.push(...validateKeyPair(config.target, 'Target'));
+  if (requiresApi) {
+    errors.push(...validateKeyPair(config.source, 'Source'));
+    errors.push(...validateKeyPair(config.target, 'Target'));
+  }
+
+  if (!config.options.auth.skipSessions) {
+    errors.push('Auth session migration is not supported; options.auth.skipSessions must remain true');
+  }
+
+  if (
+    config.options.components.schema &&
+    config.options.database.excludeTables.length > 0
+  ) {
+    errors.push('database.excludeTables requires schema sync to be disabled so excluded target tables can be preserved');
+  }
+
+  if (syncsApplicationDatabase) {
+    const managedSchemas = new Set(getManagedSchemas());
+    const explicitlyManaged = config.options.database.includeSchemas
+      .filter(schema => managedSchemas.has(schema.trim().toLowerCase()));
+    if (explicitlyManaged.length > 0) {
+      errors.push(`database.includeSchemas cannot include Supabase-managed schemas: ${explicitlyManaged.join(', ')}`);
+    }
+    if (getApplicationSchemas(config).length === 0) {
+      errors.push('At least one application schema is required when schema or data sync is enabled');
+    }
+  }
+
+  const sourceDatabase = builder.getDatabaseEndpoint(config.source.dbUrl);
+  const targetDatabase = builder.getDatabaseEndpoint(config.target.dbUrl);
+  if (sourceDatabase && sourceDatabase === targetDatabase) {
+    errors.push('Source and target resolve to the same database; refusing a destructive self-sync');
+  }
+
+  const sourceApi = config.source.apiUrl
+    ? builder.getApiEndpoint(config.source.apiUrl)
+    : null;
+  const targetApi = config.target.apiUrl
+    ? builder.getApiEndpoint(config.target.apiUrl)
+    : null;
+  if (requiresApi && sourceApi && sourceApi === targetApi) {
+    errors.push('Source and target resolve to the same API; refusing a destructive self-sync');
+  }
 
   return errors;
 }

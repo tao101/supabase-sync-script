@@ -3,10 +3,23 @@ import chalk from 'chalk';
 
 const { combine, timestamp, printf, colorize } = winston.format;
 
+export function sanitizeErrorMessage(message: string): string {
+  return message
+    .replace(/(postgres(?:ql)?:\/\/[^:\s/'"]+:)[^@\s'"]+@/gi, '$1***REDACTED***@')
+    .replace(/([?&](?:ssl)?password=)[^&\s'"]+/gi, '$1***REDACTED***')
+    .replace(/([?&]oauth_client_secret=)[^&\s'"]+/gi, '$1***REDACTED***')
+    .replace(/(PGPASSWORD=)[^\s'"]+/gi, '$1***REDACTED***');
+}
+
 const customFormat = printf(({ level, message, timestamp, ...metadata }) => {
-  let msg = `${timestamp} [${level}]: ${message}`;
+  let msg = `${timestamp} [${level}]: ${sanitizeErrorMessage(String(message))}`;
   if (Object.keys(metadata).length > 0) {
-    msg += ` ${JSON.stringify(metadata)}`;
+    msg += ` ${JSON.stringify(metadata, (_key, value) => {
+      if (value instanceof Error) {
+        return { name: value.name, message: sanitizeErrorMessage(value.message) };
+      }
+      return typeof value === 'string' ? sanitizeErrorMessage(value) : value;
+    })}`;
   }
   return msg;
 });
@@ -34,7 +47,7 @@ export function setLogLevel(level: string): void {
 
 // Sanitize sensitive data before logging
 export function sanitizeConfig(config: Record<string, unknown>): Record<string, unknown> {
-  const sensitiveKeys = ['password', 'serviceRoleKey', 'anonKey', 'dbPassword', 'secret', 'token', 'secretKey', 'publishableKey'];
+  const sensitiveKeys = ['password', 'serviceRoleKey', 'anonKey', 'dbUrl', 'dbPassword', 'secret', 'token', 'secretKey', 'publishableKey'];
 
   const sanitize = (obj: Record<string, unknown>): Record<string, unknown> => {
     const result: Record<string, unknown> = {};

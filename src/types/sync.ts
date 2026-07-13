@@ -16,6 +16,7 @@ export interface SyncResult {
 export interface StepResult {
   name: string;
   success: boolean;
+  status?: 'completed' | 'planned' | 'warning' | 'failed';
   duration: number;
   error?: Error;
   details?: Record<string, unknown>;
@@ -115,6 +116,8 @@ export interface SequenceInfo {
   schema_name: string;
   table_name: string;
   column_name: string;
+  increment_by?: string;
+  start_value?: string;
 }
 
 export interface SequenceResetResult {
@@ -122,4 +125,5 @@ export interface SequenceResetResult {
   table: string;
   column: string;
   newValue: number;
+  newValueExact?: string;
 }

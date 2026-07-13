@@ -1,41 +1,29 @@
 import pg from 'pg';
 import type { SupabaseConnection } from '../types/config.js';
 import { logger } from '../utils/logger.js';
+import { ConnectionBuilder } from '../config/connection-builder.js';
 
 const { Pool, Client } = pg;
+const quoteIdentifier = (identifier: string) => `"${identifier.replace(/"/g, '""')}"`;
 
 export type PostgresPool = pg.Pool;
 export type PostgresClient = pg.Client;
 
-// Track SSL preference per connection URL
-const sslPreference = new Map<string, boolean>();
-
-function getHostFromUrl(dbUrl: string): string {
-  try {
-    const url = new URL(dbUrl);
-    return url.hostname;
-  } catch {
-    return dbUrl;
+function rejectImplicitPlaintext(connection: SupabaseConnection, forceNoSsl?: boolean): void {
+  if (
+    forceNoSsl &&
+    new URL(new ConnectionBuilder().buildNodeDbUrl(connection)).searchParams.get('sslmode') !== 'disable'
+  ) {
+    throw new Error('forceNoSsl requires an explicit sslmode=disable database URL');
   }
-}
-
-function isLocalConnection(dbUrl: string): boolean {
-  return dbUrl.includes('localhost') || dbUrl.includes('127.0.0.1');
 }
 
 export function createPostgresPool(connection: SupabaseConnection, forceNoSsl?: boolean): PostgresPool {
   logger.debug(`Creating Postgres pool`);
-
-  const isLocalhost = isLocalConnection(connection.dbUrl);
-  const host = getHostFromUrl(connection.dbUrl);
-
-  // Check if we've already determined SSL preference for this host
-  const useNoSsl = forceNoSsl || sslPreference.get(host) === false;
-  const useSsl = !isLocalhost && !useNoSsl;
+  rejectImplicitPlaintext(connection, forceNoSsl);
 
   return new Pool({
-    connectionString: connection.dbUrl,
-    ssl: useSsl ? { rejectUnauthorized: false } : false,
+    connectionString: new ConnectionBuilder().buildNodeDbUrl(connection),
     max: 5,
     idleTimeoutMillis: 30000,
     connectionTimeoutMillis: 10000,
@@ -44,38 +32,12 @@ export function createPostgresPool(connection: SupabaseConnection, forceNoSsl?: 
 
 export function createPostgresClient(connection: SupabaseConnection, forceNoSsl?: boolean): PostgresClient {
   logger.debug(`Creating Postgres client`);
-
-  const isLocalhost = isLocalConnection(connection.dbUrl);
-  const host = getHostFromUrl(connection.dbUrl);
-
-  // Check if we've already determined SSL preference for this host
-  const useNoSsl = forceNoSsl || sslPreference.get(host) === false;
-  const useSsl = !isLocalhost && !useNoSsl;
+  rejectImplicitPlaintext(connection, forceNoSsl);
 
   return new Client({
-    connectionString: connection.dbUrl,
-    ssl: useSsl ? { rejectUnauthorized: false } : false,
+    connectionString: new ConnectionBuilder().buildNodeDbUrl(connection),
     connectionTimeoutMillis: 10000,
   });
-}
-
-export function setSslPreference(dbUrl: string, useSsl: boolean): void {
-  const host = getHostFromUrl(dbUrl);
-  sslPreference.set(host, useSsl);
-}
-
-export function getSslPreference(dbUrl: string): boolean | undefined {
-  const host = getHostFromUrl(dbUrl);
-  return sslPreference.get(host);
-}
-
-export function shouldUseSsl(dbUrl: string): boolean {
-  const isLocalhost = isLocalConnection(dbUrl);
-  if (isLocalhost) return false;
-
-  const preference = getSslPreference(dbUrl);
-  // Default to true (SSL) unless explicitly set to false
-  return preference !== false;
 }
 
 export async function testPostgresConnection(pool: PostgresPool): Promise<{ success: boolean; error?: string }> {
@@ -118,7 +80,7 @@ export async function getTableCount(pool: PostgresPool, schema: string, table: s
   const client = await pool.connect();
   try {
     const result = await client.query(
-      `SELECT COUNT(*) as count FROM "${schema}"."${table}"`
+      `SELECT COUNT(*) as count FROM ${quoteIdentifier(schema)}.${quoteIdentifier(table)}`
     );
     return parseInt(result.rows[0]?.count || '0', 10);
   } finally {
@@ -129,13 +91,12 @@ export async function getTableCount(pool: PostgresPool, schema: string, table: s
 export async function getTables(pool: PostgresPool, schemas: string[]): Promise<{ schema: string; table: string }[]> {
   const client = await pool.connect();
   try {
-    const schemaList = schemas.map(s => `'${s}'`).join(',');
     const result = await client.query(`
       SELECT schemaname as schema, tablename as table
       FROM pg_tables
-      WHERE schemaname IN (${schemaList})
+      WHERE schemaname = ANY($1)
       ORDER BY schemaname, tablename
-    `);
+    `, [schemas]);
     return result.rows;
   } finally {
     client.release();

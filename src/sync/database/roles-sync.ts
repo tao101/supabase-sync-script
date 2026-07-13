@@ -48,7 +48,7 @@ export class RolesSync {
         '--roles-only',
         '-f', dumpFile,
       ], {
-        env: { ...process.env, PGPASSWORD: this.config.source.dbPassword },
+        env: this.connectionBuilder.buildPgEnv(this.config.source),
       });
 
       logger.info(`Roles exported to ${dumpFile}`);
@@ -77,12 +77,15 @@ export class RolesSync {
     for (const line of lines) {
       // Check if this line creates or alters a system role
       const isSystemRole = SYSTEM_ROLES.some(role => {
-        const rolePattern = new RegExp(`(CREATE ROLE|ALTER ROLE)\\s+["']?${role}["']?`, 'i');
+        const rolePattern = new RegExp(
+          `(?:CREATE|ALTER) ROLE\\s+(?:"${role}"|'${role}'|${role})(?=\\s|;|$)`,
+          'i'
+        );
         return rolePattern.test(line);
       });
 
       if (isSystemRole) {
-        skipBlock = true;
+        skipBlock = !line.trim().endsWith(';');
         continue;
       }
 
@@ -113,16 +116,23 @@ export class RolesSync {
     try {
       await execa('psql', [
         targetDbUrl,
+        '-X',
+        '--single-transaction',
         '-f', dumpFile,
-        '-v', 'ON_ERROR_STOP=0',
+        '-v', 'ON_ERROR_STOP=1',
       ], {
-        env: { ...process.env, PGPASSWORD: this.config.target.dbPassword },
+        env: this.connectionBuilder.buildPgEnv(this.config.target),
       });
 
       logger.info('Roles imported successfully');
     } catch (error) {
-      // Log but don't fail - some role errors are expected
-      logger.warn(`Roles import completed with warnings: ${(error as Error).message}`);
+      throw new SyncError(
+        `Failed to import roles: ${(error as Error).message}`,
+        ErrorCategory.IMPORT,
+        'roles-import',
+        false,
+        error as Error
+      );
     }
   }
 

@@ -33,6 +33,11 @@ interface PreservedTrigger {
   enabledMode: string;
 }
 
+interface PreparedSchemaReset {
+  resetSql: string;
+  finalizeSql: string;
+}
+
 export class SchemaSync {
   private connectionBuilder: ConnectionBuilder;
 
@@ -77,7 +82,7 @@ export class SchemaSync {
 
     try {
       await execa('pg_dump', args, {
-        env: { ...process.env, PGPASSWORD: this.config.source.dbPassword },
+        env: this.connectionBuilder.buildPgEnv(this.config.source),
       });
 
       logger.info(`Schema exported to ${dumpFile}`);
@@ -93,55 +98,35 @@ export class SchemaSync {
     }
   }
 
-  async importSchema(dumpFile: string): Promise<void> {
+  async importSchema(
+    dumpFile: string,
+    resetSql: string = '',
+    finalizeSql: string = ''
+  ): Promise<void> {
     logger.info('Importing database schema to target...');
 
     const targetDbUrl = this.connectionBuilder.buildDbUrl(this.config.target);
 
     // Pre-process the dump file to remove problematic statements
     const processedFile = await this.preprocessDumpFile(dumpFile);
+    const resetFile = await this.tempFileManager.createFile('schema_reset', '.sql');
+    const finalizeFile = await this.tempFileManager.createFile('schema_finalize', '.sql');
+    await this.tempFileManager.writeFile(resetFile, resetSql);
+    await this.tempFileManager.writeFile(finalizeFile, finalizeSql);
 
     try {
-      const result = await execa('psql', [
+      await execa('psql', [
         targetDbUrl,
+        '-X',
+        '--single-transaction',
+        '-v', 'ON_ERROR_STOP=1',
+        '-f', resetFile,
         '-f', processedFile,
-        '-v', 'ON_ERROR_STOP=0', // Continue on errors (some objects may already exist)
+        '-f', finalizeFile,
       ], {
-        env: { ...process.env, PGPASSWORD: this.config.target.dbPassword },
-        reject: false, // Don't throw on non-zero exit
+        env: this.connectionBuilder.buildPgEnv(this.config.target),
       });
-
-      // Check for actual errors in stderr
-      if (result.stderr && result.stderr.trim()) {
-        const errorLines = result.stderr.split('\n').filter(line => {
-          if (!line.includes('ERROR')) return false;
-          // Filter out expected errors
-          if (line.includes('already exists')) return false;
-          if (line.includes('must be owner of')) return false; // System tables owned by supabase_admin
-          if (line.includes('current transaction is aborted')) return false; // Cascading from other errors
-          if (line.includes('permission denied')) return false; // System table permissions
-          return true;
-        });
-        if (errorLines.length > 0) {
-          logger.warn(`Schema import had ${errorLines.length} errors:`);
-          errorLines.slice(0, 5).forEach(line => logger.warn(`  ${line.trim()}`));
-          if (errorLines.length > 5) {
-            logger.warn(`  ... and ${errorLines.length - 5} more errors`);
-          }
-          throw new SyncError(
-            `Schema import failed with ${errorLines.length} error(s): ${errorLines[0]?.trim() || 'unknown error'}`,
-            ErrorCategory.IMPORT,
-            'schema-import',
-            false
-          );
-        }
-      }
-
-      if (result.exitCode !== 0) {
-        logger.warn(`Schema import completed with exit code ${result.exitCode} (some errors may be expected)`);
-      } else {
-        logger.info('Schema imported successfully');
-      }
+      logger.info('Schema imported successfully');
     } catch (error) {
       if (error instanceof SyncError) {
         throw error;
@@ -156,20 +141,15 @@ export class SchemaSync {
     }
   }
 
-  async resetTargetSchemas(): Promise<PreservedTrigger[]> {
+  async prepareTargetSchemas(): Promise<PreparedSchemaReset> {
     const schemas = getApplicationSchemas(this.config);
-    if (schemas.length === 0) return [];
+    if (schemas.length === 0) return { resetSql: '', finalizeSql: '' };
     const managedSchemas = getManagedSchemas();
 
-    logger.info(`Resetting target application schemas: ${schemas.join(', ')}`);
+    logger.info(`Preparing target application schema reset: ${schemas.join(', ')}`);
 
     const client = await this.targetPool.connect();
     try {
-      const preservedTriggers = await this.captureExternalDependentTriggers(client, schemas);
-      if (preservedTriggers.length > 0) {
-        logger.info(`Preserving ${preservedTriggers.length} external trigger(s) that depend on application schemas`);
-      }
-
       const extensionSchemasResult = await client.query(`
         SELECT n.nspname AS schema_name, e.extname AS extension_name
         FROM pg_extension e
@@ -272,8 +252,8 @@ export class SchemaSync {
         )
         SELECT dependent_object, referenced_object
         FROM dependency_schemas
-        WHERE dependent_schema IS NOT NULL
-          AND dependent_schema <> ALL($1::text[])
+        WHERE dependent_schema IS NULL
+          OR dependent_schema <> ALL($1::text[])
         ORDER BY dependent_object, referenced_object
         LIMIT 10
       `, [schemas, managedSchemas]);
@@ -291,33 +271,62 @@ export class SchemaSync {
         );
       }
 
-      await client.query('BEGIN');
-      try {
-        for (const schema of schemas) {
-          const privileges = await this.captureSchemaPrivileges(client, schema);
-          const quotedSchema = quoteIdentifier(schema);
-          await client.query(`DROP SCHEMA IF EXISTS ${quotedSchema} CASCADE`);
-          await client.query(`CREATE SCHEMA ${quotedSchema}`);
-          if (privileges) {
-            await this.restoreSchemaPrivileges(client, schema, privileges);
-          }
+      const resetStatements: string[] = [];
+      const finalizeStatements: string[] = [];
+      for (const schema of schemas) {
+        const privileges = await this.captureSchemaPrivileges(client, schema);
+        const quotedSchema = quoteIdentifier(schema);
+        resetStatements.push(
+          `DROP SCHEMA IF EXISTS ${quotedSchema} CASCADE;`,
+          `CREATE SCHEMA ${quotedSchema};`
+        );
+        if (privileges) {
+          finalizeStatements.push(this.buildSchemaPrivilegeSql(schema, privileges));
         }
-        await client.query('COMMIT');
-      } catch (error) {
-        await client.query('ROLLBACK');
-        throw error;
       }
 
-      return preservedTriggers;
+      return {
+        resetSql: resetStatements.join('\n'),
+        finalizeSql: finalizeStatements.join('\n'),
+      };
     } catch (error) {
       if (error instanceof SyncError) throw error;
       throw new SyncError(
-        `Failed to reset target schemas: ${(error as Error).message}`,
+        `Failed to prepare target schemas: ${(error as Error).message}`,
         ErrorCategory.IMPORT,
         'schema-reset',
         false,
         error as Error
       );
+    } finally {
+      client.release();
+    }
+  }
+
+  /** @deprecated Use sync() so reset and import remain in one transaction. */
+  async resetTargetSchemas(): Promise<PreservedTrigger[]> {
+    const schemas = getApplicationSchemas(this.config);
+    if (schemas.length === 0) return [];
+
+    const captureClient = await this.targetPool.connect();
+    let preservedTriggers: PreservedTrigger[];
+    try {
+      preservedTriggers = await this.captureExternalDependentTriggers(captureClient, schemas);
+    } finally {
+      captureClient.release();
+    }
+
+    const prepared = await this.prepareTargetSchemas();
+    const client = await this.targetPool.connect();
+    try {
+      await client.query('BEGIN');
+      if (prepared.resetSql) await client.query(prepared.resetSql);
+      if (prepared.finalizeSql) await client.query(prepared.finalizeSql);
+      await client.query('COMMIT');
+      return preservedTriggers;
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw error;
     } finally {
       client.release();
     }
@@ -371,45 +380,12 @@ export class SchemaSync {
     }));
   }
 
-  private async restorePreservedTriggers(triggers: PreservedTrigger[]): Promise<void> {
-    if (triggers.length === 0) return;
-
-    logger.info(`Restoring ${triggers.length} preserved external trigger(s)...`);
-
-    const client = await this.targetPool.connect();
-    let transactionStarted = false;
-    try {
-      await client.query('BEGIN');
-      transactionStarted = true;
-      for (const trigger of triggers) {
-        await client.query(
-          `DROP TRIGGER IF EXISTS ${quoteIdentifier(trigger.triggerName)} ON ${quoteIdentifier(trigger.schemaName)}.${quoteIdentifier(trigger.tableName)}`
-        );
-        await client.query(trigger.definition);
-        await client.query(
-          `ALTER TABLE ${quoteIdentifier(trigger.schemaName)}.${quoteIdentifier(trigger.tableName)} ${this.triggerEnabledAction(trigger.enabledMode)} TRIGGER ${quoteIdentifier(trigger.triggerName)}`
-        );
-      }
-      await client.query('COMMIT');
-      transactionStarted = false;
-    } catch (error) {
-      if (transactionStarted) {
-        try {
-          await client.query('ROLLBACK');
-        } catch (rollbackError) {
-          logger.warn(`Failed to roll back preserved trigger restore: ${(rollbackError as Error).message}`);
-        }
-      }
-      throw new SyncError(
-        `Failed to restore preserved triggers: ${(error as Error).message}`,
-        ErrorCategory.IMPORT,
-        'schema-reset',
-        false,
-        error as Error
-      );
-    } finally {
-      client.release();
-    }
+  private buildTriggerRestoreSql(triggers: PreservedTrigger[]): string {
+    return triggers.flatMap(trigger => [
+      `DROP TRIGGER IF EXISTS ${quoteIdentifier(trigger.triggerName)} ON ${quoteIdentifier(trigger.schemaName)}.${quoteIdentifier(trigger.tableName)};`,
+      `${trigger.definition.replace(/;?\s*$/, '')};`,
+      `ALTER TABLE ${quoteIdentifier(trigger.schemaName)}.${quoteIdentifier(trigger.tableName)} ${this.triggerEnabledAction(trigger.enabledMode)} TRIGGER ${quoteIdentifier(trigger.triggerName)};`,
+    ]).join('\n');
   }
 
   private quoteRole(role: string): string {
@@ -509,44 +485,39 @@ export class SchemaSync {
     };
   }
 
-  private async restoreSchemaPrivileges(
-    client: pg.PoolClient,
-    schema: string,
-    state: SchemaPrivilegeState
-  ): Promise<void> {
+  private buildSchemaPrivilegeSql(schema: string, state: SchemaPrivilegeState): string {
     const quotedSchema = quoteIdentifier(schema);
-
-    await client.query(
-      `ALTER SCHEMA ${quotedSchema} OWNER TO ${this.quoteRole(state.owner)}`
-    );
-
-    for (const grant of state.schemaGrants) {
-      await client.query(
-        `GRANT ${grant.privilegeType} ON SCHEMA ${quotedSchema} TO ${this.quoteRole(grant.grantee)}${grant.isGrantable ? ' WITH GRANT OPTION' : ''}`
-      );
-    }
-
-    for (const grant of state.defaultPrivilegeGrants) {
-      await client.query(
-        `ALTER DEFAULT PRIVILEGES FOR ROLE ${this.quoteRole(grant.owner)} IN SCHEMA ${quotedSchema} GRANT ${grant.privilegeType} ON ${grant.objectType} TO ${this.quoteRole(grant.grantee)}${grant.isGrantable ? ' WITH GRANT OPTION' : ''}`
-      );
-    }
+    return [
+      `ALTER SCHEMA ${quotedSchema} OWNER TO ${this.quoteRole(state.owner)};`,
+      ...state.schemaGrants.map(grant =>
+        `GRANT ${grant.privilegeType} ON SCHEMA ${quotedSchema} TO ${this.quoteRole(grant.grantee)}${grant.isGrantable ? ' WITH GRANT OPTION' : ''};`
+      ),
+      ...state.defaultPrivilegeGrants.map(grant =>
+        `ALTER DEFAULT PRIVILEGES FOR ROLE ${this.quoteRole(grant.owner)} IN SCHEMA ${quotedSchema} GRANT ${grant.privilegeType} ON ${grant.objectType} TO ${this.quoteRole(grant.grantee)}${grant.isGrantable ? ' WITH GRANT OPTION' : ''};`
+      ),
+    ].join('\n');
   }
 
   private async preprocessDumpFile(dumpFile: string): Promise<string> {
     const content = await this.tempFileManager.readFile(dumpFile);
 
-    // Remove problematic statements
-    let processed = stripUnsupportedDumpSettings(content)
-      // Remove extension creation (usually already exists)
-      .replace(/CREATE EXTENSION IF NOT EXISTS [^;]+;/gi, '')
-      // Remove comments on extensions
-      .replace(/COMMENT ON EXTENSION [^;]+;/gi, '')
-      // Remove role-related statements (handled separately)
-      .replace(/ALTER [^;]+ OWNER TO [^;]+;/gi, '')
-      // Remove problematic Supabase-specific objects
-      .replace(/CREATE POLICY [^;]+ ON "auth"\."[^"]+" [^;]+;/gi, '')
-      .replace(/CREATE POLICY [^;]+ ON "storage"\."[^"]+" [^;]+;/gi, '');
+    // pg_dump flags already exclude owners and managed schemas. Only strip a
+    // version-specific SET statement; broad SQL regexes can corrupt function bodies.
+    let processed = stripUnsupportedDumpSettings(content);
+
+    for (const schema of getApplicationSchemas(this.config)) {
+      const statement = `CREATE SCHEMA ${quoteIdentifier(schema)};`;
+      const statementIndex = processed.indexOf(statement);
+      const headerIndex = processed.lastIndexOf('-- Name:', statementIndex);
+      if (
+        statementIndex >= 0 &&
+        headerIndex >= 0 &&
+        statementIndex - headerIndex < 1000 &&
+        processed.slice(headerIndex, statementIndex).includes('Type: SCHEMA;')
+      ) {
+        processed = `${processed.slice(0, statementIndex)}${processed.slice(statementIndex + statement.length).replace(/^\r?\n/, '')}`;
+      }
+    }
 
     const processedFile = await this.tempFileManager.createFile('schema_processed', '.sql');
     await this.tempFileManager.writeFile(processedFile, processed);
@@ -562,17 +533,11 @@ export class SchemaSync {
 
     const dumpFile = await this.exportSchema();
     const sourceTriggers = await this.captureSourceExternalDependentTriggers();
-    const preservedTriggers = await this.resetTargetSchemas();
-    try {
-      await this.importSchema(dumpFile);
-      await this.restorePreservedTriggers(sourceTriggers);
-    } catch (error) {
-      try {
-        await this.restorePreservedTriggers(preservedTriggers);
-      } catch (restoreError) {
-        logger.warn(`Failed to restore preserved triggers after schema sync failure: ${(restoreError as Error).message}`);
-      }
-      throw error;
-    }
+    const prepared = await this.prepareTargetSchemas();
+    const finalizeSql = [
+      prepared.finalizeSql,
+      this.buildTriggerRestoreSql(sourceTriggers),
+    ].filter(Boolean).join('\n');
+    await this.importSchema(dumpFile, prepared.resetSql, finalizeSql);
   }
 }

@@ -1,6 +1,6 @@
 import type { Config } from '../types/config.js';
 import { loadConfig, validateConfig } from '../config/index.js';
-import { logger, print } from '../utils/logger.js';
+import { logger } from '../utils/logger.js';
 
 export async function loadCIConfig(options: {
   configPath?: string;
@@ -43,7 +43,7 @@ export function logCIProgress(step: string, status: 'start' | 'success' | 'error
 
 export function logCIConnectionTest(
   name: string,
-  status: 'testing' | 'success' | 'failed',
+  status: 'testing' | 'success' | 'failed' | 'skipped',
   message?: string
 ): void {
   const timestamp = new Date().toISOString();
@@ -56,6 +56,9 @@ export function logCIConnectionTest(
       break;
     case 'failed':
       console.log(`[${timestamp}] [FAILED] ${name}${message ? `: ${message}` : ''}`);
+      break;
+    case 'skipped':
+      console.log(`[${timestamp}] [SKIPPED] ${name}${message ? `: ${message}` : ''}`);
       break;
   }
 }
@@ -73,7 +76,7 @@ export function printCISummary(results: {
   success: boolean;
   partialSuccess?: boolean;
   duration: number;
-  steps: { name: string; success: boolean; duration: number }[];
+  steps: { name: string; success: boolean; status?: 'completed' | 'planned' | 'warning' | 'failed'; duration: number }[];
   warnings?: string[];
 }): void {
   console.log('\n');
@@ -89,9 +92,10 @@ export function printCISummary(results: {
   console.log('Steps:');
 
   for (const step of results.steps) {
-    const stepStatus = step.success ? '✓' : '✗';
+    const stepStatus = step.status === 'planned' ? '○' : step.status === 'warning' ? '!' : step.success ? '✓' : '✗';
+    const label = step.status === 'planned' ? ' [PLANNED]' : step.status === 'warning' ? ' [WARNING]' : '';
     const duration = (step.duration / 1000).toFixed(2);
-    console.log(`  ${stepStatus} ${step.name} (${duration}s)`);
+    console.log(`  ${stepStatus} ${step.name}${label} (${duration}s)`);
   }
 
   if (results.warnings && results.warnings.length > 0) {

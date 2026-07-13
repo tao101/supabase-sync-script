@@ -1,4 +1,3 @@
-import { file as tmpFile, dir as tmpDir, DirectoryResult, FileResult } from 'tmp-promise';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { logger } from './logger.js';
@@ -6,20 +5,19 @@ import { logger } from './logger.js';
 export class TempFileManager {
   private files: string[] = [];
   private dirs: string[] = [];
-  private baseDir: string;
+  private runDir: string | null = null;
 
-  constructor(baseDir: string = '/tmp/supabase-sync') {
-    this.baseDir = baseDir;
-  }
+  constructor(private baseDir: string = '/tmp/supabase-sync') {}
 
   async init(): Promise<void> {
     await fs.mkdir(this.baseDir, { recursive: true, mode: 0o700 });
-    this.dirs.push(this.baseDir);
+    this.runDir = await fs.mkdtemp(path.join(this.baseDir, 'run-'));
+    this.dirs.push(this.runDir);
   }
 
   async createFile(prefix: string, extension: string = '.sql'): Promise<string> {
     const filePath = path.join(
-      this.baseDir,
+      this.getRunDir(),
       `${prefix}-${Date.now()}${extension}`
     );
     await fs.writeFile(filePath, '', { mode: 0o600 });
@@ -28,14 +26,14 @@ export class TempFileManager {
   }
 
   async createDir(prefix: string): Promise<string> {
-    const dirPath = path.join(this.baseDir, `${prefix}-${Date.now()}`);
+    const dirPath = path.join(this.getRunDir(), `${prefix}-${Date.now()}`);
     await fs.mkdir(dirPath, { recursive: true, mode: 0o700 });
     this.dirs.push(dirPath);
     return dirPath;
   }
 
   getBasePath(): string {
-    return this.baseDir;
+    return this.runDir ?? this.baseDir;
   }
 
   async writeFile(filePath: string, content: string): Promise<void> {
@@ -51,6 +49,8 @@ export class TempFileManager {
 
   async cleanup(): Promise<void> {
     logger.info('Cleaning up temporary files...');
+    const failedFiles: string[] = [];
+    const failedDirs: string[] = [];
 
     // Delete files first
     for (const file of this.files) {
@@ -59,6 +59,7 @@ export class TempFileManager {
         logger.debug(`Deleted temp file: ${file}`);
       } catch (error) {
         logger.warn(`Failed to delete temp file: ${file}`, { error });
+        failedFiles.push(file);
       }
     }
 
@@ -69,11 +70,21 @@ export class TempFileManager {
         logger.debug(`Deleted temp directory: ${dir}`);
       } catch (error) {
         logger.warn(`Failed to delete temp directory: ${dir}`, { error });
+        failedDirs.push(dir);
       }
     }
 
-    this.files = [];
-    this.dirs = [];
+    this.files = failedFiles;
+    this.dirs = failedDirs;
+    if (!this.runDir || !failedDirs.includes(this.runDir)) this.runDir = null;
+    if (failedFiles.length > 0 || failedDirs.length > 0) {
+      throw new Error(`Failed to clean up ${failedFiles.length + failedDirs.length} temporary path(s)`);
+    }
+  }
+
+  private getRunDir(): string {
+    if (!this.runDir) throw new Error('TempFileManager must be initialized before use');
+    return this.runDir;
   }
 
   private async secureDelete(filePath: string): Promise<void> {
@@ -83,18 +94,26 @@ export class TempFileManager {
       if (stats.size > 0 && stats.size < 100 * 1024 * 1024) { // Only for files < 100MB
         const zeros = Buffer.alloc(Math.min(stats.size, 1024 * 1024));
         const handle = await fs.open(filePath, 'r+');
-        let written = 0;
-        while (written < stats.size) {
-          const toWrite = Math.min(zeros.length, stats.size - written);
-          await handle.write(zeros, 0, toWrite, written);
-          written += toWrite;
+        try {
+          let written = 0;
+          while (written < stats.size) {
+            const toWrite = Math.min(zeros.length, stats.size - written);
+            await handle.write(zeros, 0, toWrite, written);
+            written += toWrite;
+          }
+        } finally {
+          await handle.close();
         }
-        await handle.close();
       }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      // Overwriting is best effort; deletion below remains mandatory.
+    }
+
+    try {
       await fs.unlink(filePath);
-    } catch {
-      // Best effort - just try to delete
-      await fs.unlink(filePath).catch(() => {});
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
   }
 }
