@@ -9,7 +9,16 @@ test('clears auth rows without cascading into application tables', async () => {
     async query(text: string) {
       queries.push(text);
       return text.includes('information_schema.tables')
-        ? { rows: ['refresh_tokens', 'sessions', 'identities', 'users'].map(table_name => ({ table_name })) }
+        ? {
+          rows: [
+            'refresh_tokens',
+            'sessions',
+            'oauth_authorizations',
+            'oauth_consents',
+            'identities',
+            'users',
+          ].map(table_name => ({ table_name })),
+        }
         : { rows: [] };
     },
   };
@@ -19,9 +28,13 @@ test('clears auth rows without cascading into application tables', async () => {
     .clearTargetAuth(client);
 
   assert.match(queries[0], /information_schema\.tables/);
+  assert.match(queries[0], /pg_constraint/);
+  assert.match(queries[0], /'auth\.users'::regclass/);
   assert.deepEqual(queries.slice(1), [
     'DELETE FROM auth."refresh_tokens"',
     'DELETE FROM auth."sessions"',
+    'DELETE FROM auth."oauth_authorizations"',
+    'DELETE FROM auth."oauth_consents"',
     'DELETE FROM auth."identities"',
   ]);
 });

@@ -194,14 +194,27 @@ export class AuthSync {
   private async clearTargetAuth(client: pg.PoolClient): Promise<void> {
     logger.info('Clearing existing auth data on target...');
     const result = await client.query(`
-      SELECT table_name
-      FROM information_schema.tables
-      WHERE table_schema = 'auth'
-        AND table_name = ANY($1::text[])
+      SELECT tables.table_name
+      FROM information_schema.tables AS tables
+      WHERE tables.table_schema = 'auth'
+        AND tables.table_type = 'BASE TABLE'
+        AND (
+          tables.table_name = ANY($1::text[])
+          OR EXISTS (
+            SELECT 1
+            FROM pg_constraint constraint_obj
+            JOIN pg_class relation_obj ON relation_obj.oid = constraint_obj.conrelid
+            JOIN pg_namespace relation_ns ON relation_ns.oid = relation_obj.relnamespace
+            WHERE constraint_obj.contype = 'f'
+              AND constraint_obj.confrelid = 'auth.users'::regclass
+              AND relation_ns.nspname = tables.table_schema
+              AND relation_obj.relname = tables.table_name
+          )
+        )
+      ORDER BY array_position($1::text[], tables.table_name), tables.table_name
     `, [TARGET_AUTH_TABLES]);
-    const existingTables = new Set(result.rows.map(row => row.table_name));
-    for (const table of TARGET_AUTH_TABLES) {
-      if (existingTables.has(table)) {
+    for (const { table_name: table } of result.rows) {
+      if (table !== 'users') {
         await client.query(`DELETE FROM auth.${this.quoteIdentifier(table)}`);
       }
     }
