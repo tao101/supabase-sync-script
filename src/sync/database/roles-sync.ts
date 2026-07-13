@@ -46,6 +46,7 @@ export class RolesSync {
       await execa('pg_dumpall', [
         '-d', sourceDbUrl,
         '--roles-only',
+        '--no-privileges',
         '-f', dumpFile,
       ], {
         env: this.connectionBuilder.buildPgEnv(this.config.source),

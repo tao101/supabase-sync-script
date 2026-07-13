@@ -33,6 +33,32 @@ test('removes system-role statements without swallowing the next application rol
   assert.match(written, /CREATE ROLE reporting;/);
 });
 
+test('exports role definitions without grant or revoke statements', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'supabase-sync-role-export-'));
+  const script = path.join(dir, 'pg_dumpall');
+  const argsFile = path.join(dir, 'args.txt');
+  const originalPath = process.env.PATH || '';
+  try {
+    await writeFile(script, '#!/bin/sh\nprintf "%s\\n" "$@" > "$ROLE_ARGS_FILE"\n');
+    await chmod(script, 0o755);
+    process.env.PATH = `${dir}:${originalPath}`;
+    process.env.ROLE_ARGS_FILE = argsFile;
+    const sync = new RolesSync(baseConfig, {
+      async createFile() { return '/tmp/roles.sql'; },
+    } as never);
+
+    await sync.exportRoles();
+
+    const args = await readFile(argsFile, 'utf8');
+    assert.match(args, /--roles-only/);
+    assert.match(args, /--no-privileges/);
+  } finally {
+    process.env.PATH = originalPath;
+    delete process.env.ROLE_ARGS_FILE;
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test('fails role import when psql fails', async () => {
   const dir = await mkdtemp(path.join(tmpdir(), 'supabase-sync-role-'));
   const script = path.join(dir, 'psql');
